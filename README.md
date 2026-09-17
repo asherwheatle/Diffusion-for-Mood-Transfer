@@ -90,9 +90,14 @@ melody.py           MelodyExtractor — high-pass filter + CQT + top-k bin selec
                     (paper §III-B). MelodyEncoder — embeds pitch indices and downsamples
                     to match the latent temporal resolution for ControlNet injection
 
-text_encoder.py     TextEncoder — lightweight character-level transformer encoder for
-                    mood text prompts. Produces cross-attention keys/values for DiTBlock.
-                    Swap in T5-base here for production quality
+text_encoder.py     ClapTextEncoder — frozen CLAP text tower + trainable projection into
+                    DiT cross-attention tokens. Also owns the modality-gap alignment
+                    (mean-centering + Procrustes text->audio map), fitted before training
+                    and stored as buffers so every loader applies it automatically.
+                    (Legacy character-level TextEncoder kept for ablation.)
+
+mood_paraphrases.py ~60 CLAP-validated paraphrases per mood. Training samples one per
+                    step for the text path; inference/eval keep the canonical caption.
 
 train.py            train_autoencoder() — MSE training loop for the latent AE
                     train_diffusion() — v-prediction training loop for DiT+ControlNet

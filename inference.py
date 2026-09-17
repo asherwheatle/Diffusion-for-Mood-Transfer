@@ -30,6 +30,7 @@ def edit_mood(
     latent_std: torch.Tensor,
     melody_scale: float = None,
     cond_emb: torch.Tensor = None,
+    cond_space: str = "audio",
 ) -> torch.Tensor:
     """
     Edit the mood of an audio waveform using text conditioning.
@@ -48,6 +49,13 @@ def edit_mood(
     an arbitrary CLAP vector instead — e.g. a CLAP *audio* embedding, which
     lets you test the conditioning path without crossing the audio/text
     modality gap. `mood_text` is then used only for logging.
+
+    cond_space says what kind of vector cond_emb is, i.e. which alignment to
+    apply before it reaches the model:
+      "audio"  a raw CLAP audio embedding -> text_enc.align_audio (default)
+      "text"   a raw CLAP text embedding  -> text_enc.align_text
+      "as_is"  used as given (only L2-normed) — bypasses the alignment, e.g.
+               to measure what the alignment buys on a raw text vector.
 
     melody_scale rescales the melody embedding before it reaches the
     ControlNet branch (default cfg.melody_scale). 0 removes melody
@@ -88,13 +96,25 @@ def edit_mood(
 
     # Embed the same caption the trainer and the evaluator use for this mood
     # ("a sad and melancholic piece of music", not the bare tag) — a different
-    # string is a different CLAP vector.
+    # string is a different CLAP vector. Every conditioning vector goes through
+    # the modality-gap alignment the checkpoint was trained with (identity for
+    # checkpoints that predate it); see ClapTextEncoder.align_*.
     if cond_emb is not None:
         vec = cond_emb.detach().to(device).float().reshape(1, -1)
-        vec = vec / (vec.norm(dim=-1, keepdim=True) + 1e-8)
+        if cond_space == "audio":
+            vec = text_enc.align_audio(vec)
+        elif cond_space == "text":
+            vec = text_enc.align_text(vec)
+        elif cond_space == "as_is":
+            vec = vec / (vec.norm(dim=-1, keepdim=True) + 1e-8)
+        else:
+            raise ValueError(f"unknown cond_space {cond_space!r}")
         text_emb = text_enc(vec)
     else:
-        text_emb = text_enc(text_enc.encode([mood_prompt(mood_text)]))
+        text_emb = text_enc(text_enc.align_text(
+            text_enc.encode([mood_prompt(mood_text)])))
+    # The null embedding is unaligned on purpose — training builds it the same
+    # way, and matching training is all that matters for it.
     null_text_emb = text_enc(text_enc.encode([""]))
 
     # SDEdit: noise z0 up to t_start

@@ -1,37 +1,39 @@
-"""Does the conditioning path work at all, independent of the modality gap?
+"""Does the conditioning path work, and does the text path reach it?
 
-Every diagnostic so far has fed the DiT a CLAP *text* embedding at inference
-while training fed it CLAP *audio* embeddings (cfg.clap_cond_source="audio").
-Those two live in offset cones — measured on this corpus, the audio and text
-means sit at cosine ~0.21, while two *unrelated songs* sit at ~0.34. So the
-model meets an out-of-distribution vector at inference and we cannot tell
-whether a negative CLAP gain means "conditioning is broken" or merely
-"conditioning was handed coordinates from the wrong cone".
+Training conditions the DiT on CLAP *audio* embeddings
+(cfg.clap_cond_source="audio"); inference prompts it with CLAP *text*
+embeddings. The two live in offset cones, so a bad edit could mean either
+"conditioning is broken" or "conditioning was handed a vector from the wrong
+cone". Same checkpoint, same songs, same sampling noise — only the
+conditioning VECTOR changes between arms:
 
-This script separates those. Same checkpoint, same songs, same sampling noise
-- only the conditioning VECTOR changes:
+  text      the mood caption through the checkpoint's own alignment
+            (ClapTextEncoder.align_text). Exactly what inference does.
+  text_raw  the same caption with the alignment bypassed. For a checkpoint
+            trained without alignment this equals `text`; for one trained with
+            it, text - text_raw is what the alignment buys.
+  audio     the centroid of real clips of the target mood, in the model's
+            aligned audio space. The kind of vector the model trained on, so
+            the modality gap is removed entirely. THE REFERENCE ARM.
 
-  text        the CLAP text embedding of the mood prompt. Reproduces current
-              inference; the control arm.
-  audio       the mean CLAP *audio* embedding of real clips whose ground-truth
-              mood is the target. Same cone the model trained on, so the gap
-              is removed entirely. THE DECISIVE ARM.
-  text_shift  text embedding translated by (mean_audio - mean_text) and
-              renormalized. The cheap "subtract the modality offset" fix
-              (Liang et al. 2022), tested before paying to retrain.
+Primary metric: cond_margin
+---------------------------
+Every edit passes through the autoencoder + BigVGAN, which lowers CLAP cosine
+to *any* music caption. That penalty is large (~-0.14 on job_41644276) and
+nearly identical across arms and target moods, so absolute clap_gain mostly
+measures the resynthesis, not the mood. The earlier version of this probe
+judged on absolute gain and called conditioning "broken" even though, in its
+own data, the audio arm's happy/sad edits of a song diverged in 5/10 songs,
+every time in the correct direction.
 
-Scoring is unchanged from evaluate.py - the judge is still CLAP cosine of the
-edited audio against the mood *text* prompt - because that is the goal we
-actually care about. Only the input side moves.
+cond_margin compares a song's edits against EACH OTHER, which cancels the
+shared penalty: for target mood m,
 
-Read the result:
-  audio gain > 0, text gain <= 0 ... conditioning WORKS; the gap is the bug.
-                                     Invest in prompt augmentation / offset
-                                     correction / a fitted text->audio map.
-  audio gain <= 0 too ............... the gap is NOT the bug. The fault is
-                                     inside the DiT cross-attention path and
-                                     no embedding-space fix will touch it.
-  text_shift ~ audio ................ the offset fix alone is enough.
+    cond_margin = cos(edit_m, m) - mean over all targets m' of cos(edit_m', m)
+
+"How much more does the edit aimed at m sound like m than this song's edits
+do on average?" > 0 means conditioning pushed toward the target. The paired
+column counts songs where every mood's edit is classified as its own target.
 
 Usage (GPU node):
   python probe_conditioning.py \
@@ -58,16 +60,14 @@ from annotations import (load_annotations, mood_from_va,
 from evaluate import (Clap, load_models, load_clip, chroma_similarity,
                       pick_annotated_songs, MOODS, _l2)
 
-ARMS = ["text", "audio", "text_shift"]
+ARMS = ["text", "text_raw", "audio"]
 
 
-def build_reference_embeddings(clap, files, va, sr, start_s, dur_s, n_ref):
-    """Mean CLAP *audio* embedding per mood, from real annotated clips.
+def collect_reference_audio(clap, files, va, sr, start_s, dur_s, n_ref):
+    """Raw CLAP audio embeddings of up to n_ref real clips per mood.
 
-    These are the vectors the model actually trained on (cfg.clap_cond_source
-    ="audio" conditions each clip on its own audio embedding), so a centroid is
-    an in-distribution stand-in for "what this mood looks like" in the cone the
-    DiT learned. Returns (per_mood_centroid, mean_of_all_audio).
+    Returns {mood: (k, D) array}. Raw on purpose: the caller maps them into the
+    checkpoint's aligned space, so the same references serve any checkpoint.
     """
     per_mood = {m: [] for m in MOODS}
     for path in files:
@@ -78,18 +78,12 @@ def build_reference_embeddings(clap, files, va, sr, start_s, dur_s, n_ref):
         per_mood[gt].append(clap.audio_embed(wav, sr))
         if all(len(v) >= n_ref for v in per_mood.values()):
             break
-
-    cents, pool = {}, []
     for m in MOODS:
         if not per_mood[m]:
             raise RuntimeError(f"No reference clips found for mood {m!r}. "
                                f"Raise --n_ref_pool.")
-        arr = np.stack(per_mood[m])
-        pool.append(arr)
-        cents[m] = _l2(arr.mean(axis=0))
-        print(f"[REF] {m:24s} centroid from {len(arr):3d} clips")
-    mean_audio = _l2(np.concatenate(pool, axis=0).mean(axis=0))
-    return cents, mean_audio
+        print(f"[REF] {m:24s} {len(per_mood[m]):3d} reference clips")
+    return {m: np.stack(v) for m, v in per_mood.items()}
 
 
 def main():
@@ -135,31 +129,41 @@ def main():
     print(f"[PROBE] {len(test_files)} test songs, {len(ref_files)} reference "
           f"candidates (disjoint)")
 
-    cents, mean_audio = build_reference_embeddings(
-        clap, ref_files, va, sr, start_s, dur_s, args.n_ref)
-
-    # Modality offset: where the text cone sits relative to the audio cone.
-    mean_text = _l2(clap.text_emb.mean(axis=0))
-    offset = mean_audio - mean_text
-    print(f"[GAP] cos(mean_audio, mean_text) = {float(mean_audio @ mean_text):+.4f}")
-    for i, m in enumerate(MOODS):
-        print(f"[GAP] cos(text[{m[:12]:12s}], centroid[{m[:12]:12s}]) = "
-              f"{float(clap.text_emb[i] @ cents[m]):+.4f}")
-
     models = load_models(cfg, args.ckpt_dir,
                          load_clip(test_files[0], sr, start_s, dur_s),
                          bigvgan, clap=clap)
     ae, dit, melody_enc, text_enc, diffusion, lat_mean, lat_std = models
+    ck = torch.load(os.path.join(args.ckpt_dir, "diffusion.pt"),
+                    map_location="cpu", weights_only=True)
+    print(f"[PROBE] checkpoint alignment={ck.get('clap_align', 'none (pre-alignment)')}"
+          f"  paraphrases={ck.get('clap_text_paraphrases', False)}")
+
+    ref_raw = collect_reference_audio(clap, ref_files, va, sr, start_s, dur_s,
+                                      args.n_ref)
+    dev = text_enc.audio_mean.device
+    with torch.no_grad():
+        # Centroid in the space the model trained on (aligned audio).
+        cents = {m: _l2(text_enc.align_audio(torch.from_numpy(v).to(dev).float())
+                        .mean(0).cpu().numpy())
+                 for m, v in ref_raw.items()}
+        # Gap readout: how the caption sits relative to real audio, raw vs aligned.
+        all_raw = torch.from_numpy(np.concatenate(list(ref_raw.values()))).float()
+        labels = [m for m, v in ref_raw.items() for _ in range(len(v))]
+        report = text_enc.alignment_report(
+            all_raw, labels, torch.from_numpy(clap.text_emb).float(), MOODS)
+    for m in MOODS:
+        raw, aligned = report[m]
+        print(f"[GAP] caption {m[:22]:22s} margin toward own audio centroid: "
+              f"raw {raw:+.3f} -> aligned {aligned:+.3f}")
 
     def cond_for(arm, mood):
-        """The CLAP vector fed to the DiT for this arm/mood (None = text)."""
+        """(vector, cond_space) fed to edit_mood for this arm/mood."""
         if arm == "text":
-            return None
+            return None, "text"                    # the real inference path
+        if arm == "text_raw":
+            return torch.from_numpy(clap.text_emb[MOODS.index(mood)]), "as_is"
         if arm == "audio":
-            return torch.from_numpy(cents[mood])
-        if arm == "text_shift":
-            i = MOODS.index(mood)
-            return torch.from_numpy(_l2(clap.text_emb[i] + offset))
+            return torch.from_numpy(cents[mood]), "as_is"
         raise ValueError(arm)
 
     rows = []
@@ -170,19 +174,22 @@ def main():
         cos_orig = clap.cos_to_moods(clap.audio_embed(wav, sr))
         wav_t = torch.FloatTensor(wav).unsqueeze(0)
 
-        for mi, mood in enumerate(MOODS):
-            for arm in ARMS:
+        for arm in ARMS:
+            cos_by_target, song_rows = {}, []
+            for mi, mood in enumerate(MOODS):
                 # Identical noise across arms AND moods for a given song, so
                 # any difference is caused purely by the conditioning vector.
                 torch.manual_seed(args.seed + si)
+                vec, space = cond_for(arm, mood)
                 wav_e = edit_mood(
                     wav_t, mood, ae, dit, melody_enc, text_enc, diffusion,
                     bigvgan, cfg, lat_mean, lat_std,
-                    cond_emb=cond_for(arm, mood),
+                    cond_emb=vec, cond_space=space,
                 ).squeeze().numpy()
 
                 cos_edit = clap.cos_to_moods(clap.audio_embed(wav_e, sr))
-                rows.append({
+                cos_by_target[mood] = cos_edit
+                song_rows.append({
                     "song": os.path.basename(path), "song_id": sid,
                     "gt_mood": gt, "target_mood": mood, "arm": arm,
                     "clap_cos_original": round(float(cos_orig[mi]), 4),
@@ -192,6 +199,13 @@ def main():
                     "transfer_success": int(MOODS[int(np.argmax(cos_edit))] == mood),
                     "chroma_sim": round(chroma_similarity(wav, wav_e, sr), 4),
                 })
+            # Needs every target's edit of this song, hence computed afterward.
+            for r in song_rows:
+                mi = MOODS.index(r["target_mood"])
+                sibling_mean = np.mean([cos_by_target[m][mi] for m in MOODS])
+                r["cond_margin"] = round(
+                    float(cos_by_target[r["target_mood"]][mi] - sibling_mean), 4)
+            rows += song_rows
         print(f"  {os.path.basename(path)} (gt={gt}) done  [{si+1}/{len(test_files)}]")
 
     out_csv = os.path.join(args.ckpt_dir, "probe_conditioning.csv")
@@ -200,56 +214,103 @@ def main():
         w.writeheader(); w.writerows(rows)
     print(f"[PROBE] Wrote {out_csv}")
 
-    # ---- summary -----------------------------------------------------------
+    summarize(rows)
+
+
+def _song_effect(rows, arm):
+    """Mean cond_margin per song for one arm -> (mean, standard error, n).
+
+    Songs are the independent unit: the moods of one song share its audio and
+    noise, so treating each edit as independent would overstate confidence.
+    """
+    songs = sorted({r["song"] for r in rows})
+    per_song = [np.mean([r["cond_margin"] for r in rows
+                         if r["arm"] == arm and r["song"] == s]) for s in songs]
+    n = len(per_song)
+    se = float(np.std(per_song, ddof=1) / np.sqrt(n)) if n >= 2 else float("inf")
+    return float(np.mean(per_song)), se, n
+
+
+def _clearly_positive(mean, se, n):
+    """Heuristic ~2-SE test. With < 3 songs nothing counts as established."""
+    return n >= 3 and mean > 2 * se
+
+
+def summarize(rows) -> str:
+    """Print the probe summary table and verdict; returns the verdict key
+    ("broken" | "inconclusive" | "gap" | "partial" | "closed")."""
     def agg(arm, key, mood=None):
         v = [r[key] for r in rows if r["arm"] == arm
              and (mood is None or r["target_mood"] == mood)]
         return float(np.mean(v)) if v else float("nan")
 
-    print(f"\n{'='*64}\n PROBE SUMMARY  ({len(test_files)} songs x "
-          f"{len(MOODS)} moods x {len(ARMS)} arms)\n{'='*64}")
-    print(f" {'arm':<12}{'mean gain':>11}{'gain>0':>9}{'transfer%':>11}"
-          f"{'chroma':>9}")
+    def paired_correct(arm):
+        """Songs where every mood's edit is classified as its own target."""
+        songs = {r["song"] for r in rows}
+        return sum(all(r["transfer_success"] for r in rows
+                       if r["arm"] == arm and r["song"] == s) for s in songs)
+
+    n = len({r["song"] for r in rows})
+    eff = {arm: _song_effect(rows, arm) for arm in ARMS}
+    print(f"\n{'='*80}\n PROBE SUMMARY  ({n} songs x {len(MOODS)} moods x "
+          f"{len(ARMS)} arms)\n{'='*80}")
+    print(f" {'arm':<10}{'cond_margin':>12}{'+/- 2SE':>9}{'margin>0':>10}"
+          f"{'paired':>8}{'abs gain':>10}{'transfer%':>11}{'chroma':>8}")
     for arm in ARMS:
         sub = [r for r in rows if r["arm"] == arm]
-        pos = sum(1 for r in sub if r["clap_gain"] > 0)
-        print(f" {arm:<12}{agg(arm,'clap_gain'):>+11.4f}{f'{pos}/{len(sub)}':>9}"
-              f"{100*agg(arm,'transfer_success'):>10.1f}%{agg(arm,'chroma_sim'):>9.3f}")
+        pos = sum(1 for r in sub if r["cond_margin"] > 0)
+        mean, se, _ = eff[arm]
+        print(f" {arm:<10}{mean:>+12.4f}{2*se:>9.4f}{f'{pos}/{len(sub)}':>10}"
+              f"{f'{paired_correct(arm)}/{n}':>8}{agg(arm,'clap_gain'):>+10.4f}"
+              f"{100*agg(arm,'transfer_success'):>10.1f}%{agg(arm,'chroma_sim'):>8.3f}")
 
-    print(f"\n per-mood mean gain")
-    print(f" {'arm':<12}" + "".join(f"{m[:16]:>18}" for m in MOODS))
+    print("\n per-mood cond_margin")
+    print(f" {'arm':<10}" + "".join(f"{m[:16]:>18}" for m in MOODS))
     for arm in ARMS:
-        print(f" {arm:<12}" + "".join(f"{agg(arm,'clap_gain',m):>+18.4f}"
+        print(f" {arm:<10}" + "".join(f"{agg(arm,'cond_margin',m):>+18.4f}"
                                       for m in MOODS))
 
-    g_text, g_audio, g_shift = (agg(a, "clap_gain") for a in ARMS)
-    print(f"\n{'='*64}\n VERDICT\n{'='*64}")
-    if g_audio > 0 >= g_text:
-        print(" Conditioning path WORKS. Feeding an in-distribution CLAP audio\n"
-              " vector produces positive gain; only the text vector fails.\n"
-              " => The modality gap IS the bug. Fix the input side: paraphrase\n"
-              "    augmentation on the text path, offset correction, or a\n"
-              "    fitted text->audio map. No DiT surgery needed.")
-    elif g_audio <= 0:
-        print(" Conditioning path is BROKEN independent of the modality gap.\n"
-              " Even an in-distribution audio vector - the exact kind the model\n"
-              " trained on - fails to move audio toward its mood.\n"
-              " => Stop tuning embeddings. The fault is in how conditioning\n"
-              "    reaches the latent (dit.py cross-attention / the trainable\n"
-              "    projection), or the model never learned mood at all.")
+    (m_text, se_text, _), (m_raw, se_raw, _), (m_audio, se_audio, _) = (
+        eff[a] for a in ARMS)
+    audio_pos = _clearly_positive(m_audio, se_audio, n)
+    text_pos = _clearly_positive(m_text, se_text, n)
+    gains = [agg(a, "clap_gain") for a in ARMS]
+    print(f"\n{'='*80}\n VERDICT  (effect = per-song mean cond_margin, counted "
+          f"only if > 2 SE; n={n} songs)\n{'='*80}")
+    if not audio_pos and m_audio <= 0 and n >= 3:
+        key = "broken"
+        print(" Even the in-distribution audio vector does not push edits toward\n"
+              " their target. The fault is in how conditioning reaches the latent\n"
+              " (dit.py cross-attention / the projection), or mood was never\n"
+              " learned. No embedding-space fix will help.")
+    elif not audio_pos:
+        key = "inconclusive"
+        print(f" INCONCLUSIVE: the audio arm's effect ({m_audio:+.4f} +/- "
+              f"{2*se_audio:.4f}) is not\n distinguishable from noise with {n} "
+              f"songs. Re-run with more --n_songs\n before drawing any conclusion "
+              f"about conditioning or the gap.")
+    elif not text_pos:
+        key = "gap"
+        print(" Conditioning WORKS (audio arm clearly > 0) but the text path does\n"
+              " not reliably reach it. The modality gap is still the blocker.")
+    elif m_text >= 0.8 * m_audio:
+        key = "closed"
+        print(" The text path drives mood about as well as the in-distribution\n"
+              " audio vector: the gap is effectively closed.")
     else:
-        print(" Mixed: text already works, so the gap was not the blocker.\n"
-              " Re-check the evaluation setup rather than the conditioning.")
-    if g_shift > g_text:
-        print(f"\n Offset correction helps: {g_text:+.4f} -> {g_shift:+.4f} "
-              f"({g_shift - g_text:+.4f}).")
-        if g_audio > 0 and g_shift >= 0.8 * g_audio:
-            print(" It recovers most of the audio-arm gain — the cheap fix may"
-                  " be enough on its own.")
-    else:
-        print(f"\n Offset correction does NOT help ({g_text:+.4f} -> "
-              f"{g_shift:+.4f}); a constant translation is not the whole gap.")
-    print("="*64)
+        key = "partial"
+        print(f" The text path works but recovers {100*m_text/m_audio:.0f}% of the\n"
+              f" audio arm's effect — some gap remains.")
+    if m_text != m_raw:
+        print(f"\n Alignment effect on the caption: text_raw {m_raw:+.4f} -> "
+              f"text {m_text:+.4f} ({m_text - m_raw:+.4f}).")
+    if all(g < 0 for g in gains) and max(gains) - min(gains) < 0.05:
+        print(f"\n Absolute gain is negative for every arm ({min(gains):+.3f} to "
+              f"{max(gains):+.3f}) and nearly\n identical across them: that is "
+              f"the autoencoder + vocoder resynthesis\n penalty, not mood. Read "
+              f"cond_margin, not abs gain.")
+    print("="*80)
+    return key
 
 
 if __name__ == "__main__":

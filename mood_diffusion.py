@@ -243,6 +243,11 @@ def main():
             "latent_mean": latent_mean,
             "latent_std": latent_std,
             "clap_cond_source": getattr(cfg, "clap_cond_source", "text"),
+            # Provenance only; the alignment itself is in text_enc's buffers.
+            "clap_align": (getattr(cfg, "clap_align", "none")
+                           if getattr(cfg, "clap_cond_source", "text") == "audio"
+                           else "none"),
+            "clap_text_paraphrases": getattr(cfg, "clap_text_paraphrases", False),
         }, diff_path)
         print(f"  Saved diffusion model: {diff_path}")
 

@@ -92,6 +92,26 @@ class DiffusionConfig:
     #       rather than only assumed to transfer.
     clap_audio_noise = 0.10
     clap_text_mix = 0.25
+    # Sample the text-mix prompt from ~60 paraphrases per mood
+    # (mood_paraphrases.py) instead of the one canonical caption, so the text
+    # path sees a spread-out distribution per mood and the projection has to
+    # learn the happy<->sad direction rather than two fixed addresses.
+    # Inference and evaluation still use the canonical caption.
+    clap_text_paraphrases = True
+    # Modality-gap correction, fitted once before training and saved in the
+    # checkpoint (ClapTextEncoder buffers), so inference applies the same map.
+    #   "none"   — raw CLAP vectors (the previous behaviour)
+    #   "center" — subtract each modality's mean and renormalise
+    #   "map"    — center, then rotate text into audio space (Procrustes)
+    # Measured on this corpus with held-out paraphrases, the margin of a text
+    # vector toward its own mood's audio centroid was +0.07 raw, +0.29
+    # centered, +0.54 mapped — the last matching real audio clips (+0.53).
+    clap_align = "map"
+    # Procrustes shrinkage toward identity (fraction of the cross-covariance
+    # spectral norm). Pins the ~510 directions with no mood signal to
+    # identity; 0.01-0.1 gave the same held-out margin, larger values rotate
+    # less (0.5: +0.49, 2.0: +0.38).
+    clap_map_reg = 0.1
 
     # Diffusion
     num_train_timesteps = 1000
