@@ -21,7 +21,7 @@ Where:
 - `<detailed commit message>` explains *why* the change was made, not just what changed, following the repository's existing commit message style (see `git log` for examples).
 - End every commit message with:
   ```
-  Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+  Co-Authored-By: Claude <model name here> <noreply@anthropic.com>
   ```
 
 ## Notes
