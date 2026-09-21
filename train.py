@@ -15,6 +15,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 
 from config import DiffusionConfig
+from mood_paraphrases import paraphrases_for
 from autoencoder import LatentAutoencoder
 from text_encoder import ClapTextEncoder
 from dit import MoodDiT
@@ -30,6 +31,41 @@ def _atomic_save(obj, path: str):
     tmp = path + ".tmp"
     torch.save(obj, tmp)
     os.replace(tmp, path)
+
+
+def _mel_recon_loss(recon: torch.Tensor, target: torch.Tensor,
+                    cfg: DiffusionConfig) -> torch.Tensor:
+    """Sharpness-preserving reconstruction loss for mel autoencoding.
+
+    Pure MSE rewards blur — it minimizes average error by smoothing — and
+    BigVGAN turns a blurred mel into distorted audio. We replace it with:
+      * L1        — sharper base term than MSE
+      * gradient  — match time/freq derivatives, so harmonics and onsets are
+                    preserved instead of averaged away (directly counters the
+                    lost mel-gradient energy we measured in reconstructions)
+      * multiscale— L1 at coarser resolutions to keep global structure
+    This is the mel-space analog of a multi-resolution STFT loss; the AE never
+    sees waveforms, so the terms are applied on the spectrogram itself.
+    """
+    l1 = F.l1_loss(recon, target)
+
+    # gradient-difference (edge) loss along time and frequency
+    grad = (F.l1_loss(recon[..., 1:] - recon[..., :-1],
+                      target[..., 1:] - target[..., :-1]) +
+            F.l1_loss(recon[..., 1:, :] - recon[..., :-1, :],
+                      target[..., 1:, :] - target[..., :-1, :]))
+
+    # multi-scale L1: compare at 1/2, 1/4, 1/8 resolution
+    ms = recon.new_zeros(())
+    r, t = recon, target
+    for _ in range(3):
+        r = F.avg_pool2d(r, 2)
+        t = F.avg_pool2d(t, 2)
+        ms = ms + F.l1_loss(r, t)
+
+    return (getattr(cfg, "ae_l1_weight", 1.0) * l1 +
+            getattr(cfg, "ae_grad_weight", 1.0) * grad +
+            getattr(cfg, "ae_ms_weight", 0.5) * ms)
 
 
 def train_autoencoder(mel_batch: torch.Tensor, cfg: DiffusionConfig):
@@ -96,14 +132,14 @@ def train_autoencoder(mel_batch: torch.Tensor, cfg: DiffusionConfig):
             if recon.shape != batch.shape:
                 recon = F.interpolate(recon, size=batch.shape[2:],
                                       mode="bilinear", align_corners=False)
-            loss = F.mse_loss(recon, batch)
+            loss = _mel_recon_loss(recon, batch, cfg)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
             n_batches += 1
 
         if epoch % cfg.log_interval == 0 or epoch == 1:
-            tqdm.write(f"  Epoch {epoch:4d} | MSE: {epoch_loss / max(n_batches, 1):.6f}")
+            tqdm.write(f"  Epoch {epoch:4d} | recon loss: {epoch_loss / max(n_batches, 1):.6f}")
 
         if epoch % ckpt_interval == 0 or epoch == cfg.ae_epochs:
             # Resumable checkpoint (model + optimizer + epoch) ...
@@ -131,7 +167,8 @@ def _encode_latents(ae: LatentAutoencoder, mel_padded: torch.Tensor,
 
 def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
                     melody_all: torch.Tensor, mood_texts: list[str],
-                    cfg: DiffusionConfig):
+                    cfg: DiffusionConfig, clap_audio: torch.Tensor = None,
+                    clap_model=None):
     """
     Train the DiT + ControlNet diffusion model in the autoencoder's latent space.
 
@@ -139,6 +176,10 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
         mel_batch: (N, 1, n_mels, T) normalized mels, one per clip (CPU)
         melody_all: (N, top_k, T_cqt) precomputed melody pitch indices (CPU)
         mood_texts: list of N mood strings, one per clip
+        clap_audio: (N, clap_dim) per-clip CLAP audio embeddings. Required
+            when cfg.clap_cond_source == "audio"; ignored otherwise.
+        clap_model: an already-loaded CLAP module to reuse (avoids a second
+            ~2 GB load when the caller built one for the dataset pass).
 
     Each step:
       1. Sample a minibatch of songs' latents z0
@@ -179,14 +220,86 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
     melody_enc = MelodyEncoder(d_model=cfg.d_model, top_k=cfg.melody_top_k).to(device)
     # Frozen CLAP text tower + trainable projection (Lever A). Only the
     # projection is optimized; CLAP is frozen and off the training hot path.
-    text_enc = ClapTextEncoder(cfg.d_model, clap_ckpt=cfg.clap_ckpt,
+    text_enc = ClapTextEncoder(cfg.d_model, clap_model=clap_model,
+                               clap_ckpt=cfg.clap_ckpt,
                                n_tokens=cfg.text_n_tokens, device=device).to(device)
     diffusion = GaussianDiffusion(cfg.num_train_timesteps, device)
 
-    # Precompute each song's frozen CLAP text embedding once (there are only a
-    # handful of unique mood strings), plus the null embedding for CFG dropout.
-    clap_emb_all = text_enc.encode(mood_texts).cpu()          # (N, clap_dim)
+    # Null (CFG) embedding: deliberately left unaligned — inference builds it
+    # the same way, which is the only thing that matters for it.
     null_clap_emb = text_enc.encode([""])[0].to(device)       # (clap_dim,)
+
+    # What each clip is conditioned on. "audio" gives every clip its own CLAP
+    # audio embedding; "text" conditions every step on a mood prompt, which
+    # (without paraphrases) collapses the whole set onto 2 vectors and lets
+    # the projection degenerate into a lookup table.
+    cond_source = getattr(cfg, "clap_cond_source", "text")
+    use_paraphrases = getattr(cfg, "clap_text_paraphrases", False)
+    align_mode = getattr(cfg, "clap_align", "none")
+
+    # Training prompts: every paraphrase of every mood, laid out contiguously
+    # per mood, so "a random prompt of mood k" is
+    # para_start[k] + floor(U[0,1) * para_count[k]). Sampling happens per
+    # step, so the text path sees a distribution per mood, not a single point.
+    uniq_moods = sorted(set(mood_texts))
+    mood_row = torch.tensor([uniq_moods.index(m) for m in mood_texts])  # (N,)
+    prompts, prompt_labels, para_start, para_count = [], [], [], []
+    for m in uniq_moods:
+        ps = paraphrases_for(m, use_paraphrases)
+        para_start.append(len(prompts))
+        para_count.append(len(ps))
+        prompts += ps
+        prompt_labels += [m] * len(ps)
+    para_start = torch.tensor(para_start, device=device)
+    para_count = torch.tensor(para_count, device=device)
+    prompt_raw = text_enc.encode(prompts)                      # (P, clap_dim)
+
+    if cond_source == "audio":
+        if clap_audio is None:
+            raise ValueError(
+                "cfg.clap_cond_source='audio' needs per-clip CLAP audio "
+                "embeddings. Pass clap_embedder=... to build_dataset so it "
+                "returns them (and delete any pre-CLAP cache).")
+        if clap_audio.shape[0] != n_songs:
+            raise ValueError(
+                f"clap_audio has {clap_audio.shape[0]} rows but there are "
+                f"{n_songs} clips — stale cache?")
+        # Fit the modality-gap alignment on this corpus + prompt set. It is
+        # frozen from here on and saved in text_enc's state dict, so inference
+        # applies exactly the transform training used.
+        text_enc.fit_alignment(clap_audio, mood_texts, prompt_raw,
+                               prompt_labels, mode=align_mode,
+                               reg=getattr(cfg, "clap_map_reg", 0.1))
+        text_mix = cfg.clap_text_mix
+        print(f"[COND] Conditioning on per-clip CLAP AUDIO embeddings "
+              f"{tuple(clap_audio.shape)}; noise={cfg.clap_audio_noise}, "
+              f"text_mix={text_mix}")
+        print(f"[ALIGN] mode={align_mode}"
+              + (f" reg={cfg.clap_map_reg}" if align_mode == "map" else "")
+              + f"; prompts={len(prompts)} "
+              f"({', '.join(f'{c} {m.split()[0]}' for m, c in zip(uniq_moods, para_count.tolist()))})")
+        # Margin toward the correct mood's audio centroid (in-sample; >0 means
+        # the vector points at its own mood). The canonical caption is the one
+        # inference and evaluation actually use.
+        canon = text_enc.alignment_report(
+            clap_audio, mood_texts, prompt_raw[para_start], uniq_moods)
+        para = text_enc.alignment_report(
+            clap_audio, mood_texts, prompt_raw, prompt_labels)
+        print("[ALIGN] text->own-mood audio margin (raw -> aligned):")
+        for m in uniq_moods:
+            print(f"[ALIGN]   {m:22s} caption {canon[m][0]:+.3f} -> "
+                  f"{canon[m][1]:+.3f}   paraphrases {para[m][0]:+.3f} -> "
+                  f"{para[m][1]:+.3f}")
+    else:
+        # Legacy text conditioning: every clip gets a sampled prompt of its
+        # mood on every step. With no audio embeddings there is no gap to
+        # correct, so the alignment stays at identity.
+        if align_mode != "none":
+            print(f"[ALIGN] clap_align={align_mode!r} ignored: it needs "
+                  f"clap_cond_source='audio'")
+        text_mix = 1.0
+        print(f"[COND] Conditioning on mood TEXT prompts "
+              f"({len(prompts)} prompts for {len(uniq_moods)} moods)")
 
     all_params = (list(dit.parameters()) +
                   list(melody_enc.parameters()) +
@@ -208,9 +321,16 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
         print(f"[RESUME] Diffusion resumed from step {ck['epoch']} "
               f"-> continuing at {start_epoch} ({ckpt_path})")
 
-    # Mood-balanced sampling: DEAM is heavily skewed (lots of happy/
-    # energetic, few sad/dark clips), so uniform sampling would starve
-    # the rare moods of gradient updates and bias the conditioning.
+    # Apply the alignment only now, after any resume: a resumed checkpoint
+    # carries the alignment its weights were trained under, and the vectors
+    # fed from here on must match that, not a fresh fit.
+    clap_emb_all = (text_enc.align_audio(clap_audio.float()).cpu()
+                    if cond_source == "audio" else None)       # (N, clap_dim)
+    prompt_emb = text_enc.align_text(prompt_raw)               # (P, clap_dim)
+
+    # Mood-balanced sampling: DEAM is skewed toward positive valence
+    # (~70/30 happy/sad even after the dead band), so uniform sampling
+    # would under-train the sad side and bias the conditioning.
     # Weight each clip by the inverse of its mood's frequency so every
     # mood contributes ~equally to training batches.
     from collections import Counter
@@ -241,6 +361,13 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
             "text_enc": text_enc.state_dict(),
             "latent_mean": latent_mean,
             "latent_std": latent_std,
+            # Records what the projection was trained to accept, so a
+            # checkpoint can be told apart from a legacy text-conditioned one.
+            "clap_cond_source": cond_source,
+            # Provenance only — the alignment itself lives in text_enc's
+            # buffers and is applied by load_state_dict.
+            "clap_align": align_mode if cond_source == "audio" else "none",
+            "clap_text_paraphrases": use_paraphrases,
         }
         # Inference-ready copy (what evaluate.py / edit mode load) ...
         _atomic_save(state, os.path.join(cfg.output_dir, "diffusion.pt"))
@@ -262,7 +389,31 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
 
         mel_emb = melody_enc(melody_all[idx].to(device, non_blocking=True), W_lat)
 
-        clap_emb = clap_emb_all[idx].to(device)   # (B, clap_dim), a fresh copy
+        if clap_emb_all is not None:
+            clap_emb = clap_emb_all[idx].to(device)   # (B, clap_dim), a fresh copy
+            # Bridge CLAP's modality gap: jitter the (aligned) audio embedding
+            # so the model tolerates a shifted input.
+            if cfg.clap_audio_noise > 0:
+                n = torch.randn_like(clap_emb)
+                n = n / (n.norm(dim=-1, keepdim=True) + 1e-8)
+                clap_emb = clap_emb + cfg.clap_audio_noise * n
+                clap_emb = clap_emb / (clap_emb.norm(dim=-1, keepdim=True) + 1e-8)
+        else:
+            clap_emb = torch.empty(cfg.batch_size, prompt_emb.shape[1],
+                                   device=device)
+
+        # Hand some rows (audio mode) or all rows (text mode) a TEXT prompt of
+        # the clip's mood, drawn fresh from its paraphrase set, so the
+        # inference-time text path is trained directly on a distribution
+        # rather than on one fixed caption.
+        if text_mix > 0:
+            swap = torch.rand(cfg.batch_size, device=device) < text_mix
+            k = mood_row[idx].to(device)
+            pick = (torch.rand(cfg.batch_size, device=device)
+                    * para_count[k]).long()
+            pick = torch.minimum(pick, para_count[k] - 1)
+            clap_emb[swap] = prompt_emb[(para_start[k] + pick)[swap]]
+
         drop = torch.rand(cfg.batch_size, device=device) < cfg.cfg_dropout
         clap_emb[drop] = null_clap_emb
         text_emb = text_enc(clap_emb)

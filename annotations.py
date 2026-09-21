@@ -1,5 +1,9 @@
 """DEAM valence/arousal annotation loading and mood-text mapping.
 
+Mood labels are binary and come from valence only (see `mood_from_va`);
+arousal is still loaded because the valence probe and the analysis scripts
+use it, but it plays no part in labeling.
+
 DEAM provides two annotation formats, both supported here:
 
   dynamic (per-second):  arousal.csv / valence.csv
@@ -22,29 +26,56 @@ import os
 import numpy as np
 
 
-# Same vocabulary the model was already trained with, so existing
-# inference prompts keep working.
-MOOD_QUADRANTS = {
-    (True, True): "happy and uplifting",       # high arousal, high valence
-    (True, False): "energetic and powerful",   # high arousal, low valence
-    (False, True): "calm and peaceful",        # low arousal, high valence
-    (False, False): "sad and melancholic",     # low arousal, low valence
+# Two moods, split on valence alone. Arousal is deliberately ignored: the
+# arousal-derived labels ("energetic and powerful", "calm and peaceful") are
+# the ones CLAP separates worst, so carrying them cost more CLAP gain than
+# the extra vocabulary was worth. The smallest possible vocabulary gives the
+# conditioning signal the best chance of being learned.
+MOOD_HAPPY = "happy and uplifting"
+MOOD_SAD = "sad and melancholic"
+
+# Caption-like prompts for each mood. CLAP was trained on natural captions,
+# not bare tags, so "a sad and melancholic piece of music" lands in a much
+# better place than "sad and melancholic". This is the single source of truth:
+# training, inference and evaluation must all embed the SAME string for a
+# mood, or the model is conditioned on one vector and judged against another.
+MOOD_PROMPTS = {
+    MOOD_HAPPY: "a happy and uplifting piece of music",
+    MOOD_SAD:   "a sad and melancholic piece of music",
 }
 
-# Valence below this (on the [-1, 1] scale) with low arousal reads as
-# "dark" rather than merely "sad".
-DARK_VALENCE_THRESHOLD = -0.25
+
+def mood_prompt(mood: str) -> str:
+    """Caption for a mood label; passes unknown strings through unchanged."""
+    return MOOD_PROMPTS.get(mood, mood)
+
+
+# Half-width of the dead band around valence 0. Clips landing inside it are
+# dropped rather than labeled: DEAM's valence ratings sit on a positive shift,
+# so a clip at v = -0.05 is "slightly below the corpus mean", not something a
+# listener would call sad. Labeling those as sad is what made the two classes
+# overlap. The band costs ~28% of the clips and leaves ~7.6k genuinely-labeled
+# ones at roughly 70/30 happy/sad.
+VALENCE_DEAD_BAND = 0.1
 
 # Dynamic annotations start at 15 s into each excerpt.
 DYNAMIC_START_MS = 15000
 DYNAMIC_STEP_MS = 500
 
 
-def mood_from_va(valence: float, arousal: float) -> str:
-    """Map a (valence, arousal) pair on the [-1, 1] scale to a mood string."""
-    if arousal <= 0 and valence < DARK_VALENCE_THRESHOLD:
-        return "dark and mysterious"
-    return MOOD_QUADRANTS[(arousal > 0, valence > 0)]
+def mood_from_va(valence: float, arousal: float = None):
+    """Map a valence on the [-1, 1] scale to a mood string.
+
+    `arousal` is accepted (so existing `mood_from_va(*va[sid])` calls keep
+    working) but ignored. Returns None for clips inside the dead band, i.e.
+    ones whose label is too ambiguous to train or evaluate on; every caller
+    must handle that by dropping the clip.
+    """
+    if valence > VALENCE_DEAD_BAND:
+        return MOOD_HAPPY
+    if valence < -VALENCE_DEAD_BAND:
+        return MOOD_SAD
+    return None
 
 
 def _find_file(annotations_dir: str, filename: str):

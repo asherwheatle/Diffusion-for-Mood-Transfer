@@ -6,12 +6,60 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from config import DiffusionConfig
+from annotations import mood_prompt
 from autoencoder import LatentAutoencoder
 from melody import MelodyExtractor, MelodyEncoder
 from text_encoder import ClapTextEncoder
 from dit import MoodDiT
 from diffusion import GaussianDiffusion
 from pipeline import bigvgan_mel_spectrogram, FixedMelNormalizer, pad_spectrogram, unpad_spectrogram
+
+
+@torch.no_grad()
+def reconstruct(
+    waveform: torch.Tensor,
+    ae: LatentAutoencoder,
+    bigvgan_model,
+    cfg: DiffusionConfig,
+) -> torch.Tensor:
+    """Round-trip audio through the autoencoder + vocoder with NO diffusion.
+
+    This is the reconstruction control for evaluation. Every edit produced by
+    `edit_mood` pays a resynthesis cost — mel -> encoder -> decoder -> BigVGAN
+    lowers CLAP cosine to *any* caption and shifts the valence probe, because
+    both judges were fit on real audio and have never seen vocoded audio. That
+    cost is a property of the codec, not of the mood edit.
+
+    Comparing an edit against this output instead of against the raw input
+    subtracts the cost, so what is left is attributable to the conditioning.
+    The path below mirrors `edit_mood` exactly except that the latent goes
+    straight from encoder to decoder: the latent standardization round-trip is
+    the identity here, so it is omitted.
+
+    Returns:
+        wav_out: (1, T_samples) reconstructed waveform tensor
+    """
+    device = cfg.device
+
+    mel = bigvgan_mel_spectrogram(waveform, bigvgan_model)
+    normalizer = FixedMelNormalizer()
+    mel_norm = normalizer.normalize(mel)
+    mel_padded, orig_hw = pad_spectrogram(mel_norm.unsqueeze(0))
+    mel_padded = mel_padded.to(device)
+
+    z0 = ae.encoder(mel_padded)
+    recon_mel_norm = ae.decoder(z0)
+    if recon_mel_norm.shape != mel_padded.shape:
+        recon_mel_norm = F.interpolate(
+            recon_mel_norm, size=mel_padded.shape[2:],
+            mode="bilinear", align_corners=False
+        )
+    recon_mel_norm = unpad_spectrogram(recon_mel_norm, orig_hw)
+    recon_mel = normalizer.denormalize(recon_mel_norm.squeeze(0).cpu())
+
+    with torch.inference_mode():
+        wav_out = bigvgan_model(recon_mel.to(device))
+    return wav_out.squeeze(0).cpu().clamp(-1.0, 1.0)
 
 
 @torch.no_grad()
@@ -27,6 +75,9 @@ def edit_mood(
     cfg: DiffusionConfig,
     latent_mean: torch.Tensor,
     latent_std: torch.Tensor,
+    melody_scale: float = None,
+    cond_emb: torch.Tensor = None,
+    cond_space: str = "audio",
 ) -> torch.Tensor:
     """
     Edit the mood of an audio waveform using text conditioning.
@@ -39,6 +90,24 @@ def edit_mood(
       5. Decode -> BigVGAN -> output waveform
 
     edit_strength=0: no change. edit_strength=1: full regen from noise.
+
+    cond_emb overrides the conditioning vector. Normally the CLAP *text*
+    embedding of `mood_text` is used; pass a (clap_dim,) tensor here to feed
+    an arbitrary CLAP vector instead — e.g. a CLAP *audio* embedding, which
+    lets you test the conditioning path without crossing the audio/text
+    modality gap. `mood_text` is then used only for logging.
+
+    cond_space says what kind of vector cond_emb is, i.e. which alignment to
+    apply before it reaches the model:
+      "audio"  a raw CLAP audio embedding -> text_enc.align_audio (default)
+      "text"   a raw CLAP text embedding  -> text_enc.align_text
+      "as_is"  used as given (only L2-normed) — bypasses the alignment, e.g.
+               to measure what the alignment buys on a raw text vector.
+
+    melody_scale rescales the melody embedding before it reaches the
+    ControlNet branch (default cfg.melody_scale). 0 removes melody
+    information entirely — use it to test whether melody control is so
+    strong it pins the output to the input and blocks the mood edit.
 
     Returns:
         wav_out: (1, T_samples) output waveform tensor
@@ -67,25 +136,52 @@ def edit_mood(
     melody_tensor = torch.from_numpy(melody_indices).unsqueeze(0).to(device)
     W_lat = z0.shape[-1]
     melody_emb = melody_enc(melody_tensor, W_lat)
+    if melody_scale is None:
+        melody_scale = getattr(cfg, "melody_scale", 1.0)
+    if melody_scale != 1.0:
+        melody_emb = melody_emb * melody_scale
 
-    text_emb = text_enc(text_enc.encode([mood_text]))
+    # Embed the same caption the trainer and the evaluator use for this mood
+    # ("a sad and melancholic piece of music", not the bare tag) — a different
+    # string is a different CLAP vector. Every conditioning vector goes through
+    # the modality-gap alignment the checkpoint was trained with (identity for
+    # checkpoints that predate it); see ClapTextEncoder.align_*.
+    if cond_emb is not None:
+        vec = cond_emb.detach().to(device).float().reshape(1, -1)
+        if cond_space == "audio":
+            vec = text_enc.align_audio(vec)
+        elif cond_space == "text":
+            vec = text_enc.align_text(vec)
+        elif cond_space == "as_is":
+            vec = vec / (vec.norm(dim=-1, keepdim=True) + 1e-8)
+        else:
+            raise ValueError(f"unknown cond_space {cond_space!r}")
+        text_emb = text_enc(vec)
+    else:
+        text_emb = text_enc(text_enc.align_text(
+            text_enc.encode([mood_prompt(mood_text)])))
+    # The null embedding is unaligned on purpose — training builds it the same
+    # way, and matching training is all that matters for it.
     null_text_emb = text_enc(text_enc.encode([""]))
 
     # SDEdit: noise z0 up to t_start
     T = cfg.num_train_timesteps
     t_start = max(1, min(int(cfg.edit_strength * T), T - 1))
 
-    step_ratio = T // cfg.num_inference_steps
-    timesteps = list(range(t_start, 0, -step_ratio))
-    if timesteps[-1] != 0:
-        timesteps.append(0)
+    # Evenly spaced timesteps from t_start down to 0. The old form used a
+    # fixed stride (T // num_inference_steps), which made the step COUNT
+    # depend on edit_strength — a gentle edit silently got far fewer steps
+    # than a strong one, so the two weren't comparable.
+    grid = np.linspace(t_start, 0, cfg.num_inference_steps + 1)
+    timesteps = list(dict.fromkeys(grid.round().astype(int).tolist()))
 
     noise = torch.randn_like(z0)
     t_tensor = torch.tensor([t_start], device=device)
     z_t = diffusion.q_sample(z0, t_tensor, noise)
 
-    print(f"[EDIT] SDEdit from t={t_start} ({len(timesteps)} steps), "
-          f"CFG scale={cfg.cfg_scale}")
+    print(f"[EDIT] SDEdit from t={t_start} ({len(timesteps) - 1} steps), "
+          f"CFG scale={cfg.cfg_scale}, eta={getattr(cfg, 'ddim_eta', 0.0)}, "
+          f"melody_scale={melody_scale}")
     print(f"[EDIT] Mood text: \"{mood_text}\"")
 
     # DDIM denoising with CFG on text only (paper section IV-C)
@@ -97,7 +193,8 @@ def edit_mood(
         v_uncond = dit(z_t, t_cur, null_text_emb, melody_emb)
         v_guided = v_uncond + cfg.cfg_scale * (v_cond - v_uncond)
 
-        z_t = diffusion.ddim_step(z_t, v_guided, t_cur, t_prev)
+        z_t = diffusion.ddim_step(z_t, v_guided, t_cur, t_prev,
+                                  eta=getattr(cfg, "ddim_eta", 0.0))
 
     # Undo standardization before the decoder (it expects raw encoder-scale latents)
     z_t = z_t * latent_std + latent_mean

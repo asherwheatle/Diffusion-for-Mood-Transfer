@@ -2,9 +2,9 @@
 
 Motivation
 ----------
-The main evaluation (evaluate.py) judges a mood edit two ways: CLAP's 5-way
-mood argmax (transfer_success) and chroma preservation. The mood argmax is
-coarse — it only tells you which of five buckets an edit landed in. This probe
+The main evaluation (evaluate.py) judges a mood edit two ways: CLAP's happy/sad
+argmax (transfer_success) and chroma preservation. The mood argmax is
+coarse — it only tells you which of the two buckets an edit landed in. This probe
 adds a *continuous valence axis* so we can ask a sharper question: did the edit
 move the audio's positivity (valence) in the intended direction, and by how
 much?
@@ -39,16 +39,12 @@ import os
 import numpy as np
 
 
-# Desired valence direction for each target mood, consistent with the
-# quadrant mapping in annotations.mood_from_va (high-valence moods vs low).
-# "energetic and powerful" sits at low valence / high arousal in DEAM's
-# scheme, so its valence signal is the weakest of the five — read it with care.
+# Desired valence direction for each target mood. The labels are now derived
+# from valence alone (annotations.mood_from_va), so these signs are exactly
+# the two sides of that split rather than an approximation of a quadrant.
 MOOD_VALENCE_SIGN = {
-    "happy and uplifting":     +1,
-    "calm and peaceful":       +1,
-    "energetic and powerful":  -1,
-    "sad and melancholic":     -1,
-    "dark and mysterious":     -1,
+    "happy and uplifting":  +1,
+    "sad and melancholic":  -1,
 }
 
 

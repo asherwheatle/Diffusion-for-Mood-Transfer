@@ -4,7 +4,7 @@ Implementation of [Editing Music with Melody and Text: Using ControlNet for Diff
 
 ## What it does
 
-Takes an audio clip and a text mood description (e.g. `"dark and mysterious"`) and outputs a version of the audio with the mood altered while preserving the original melody structure. The ControlNet branch locks in pitch/melody via CQT features; the DiT is steered by the text prompt via cross-attention and classifier-free guidance.
+Takes an audio clip and a text mood description (`"happy and uplifting"` or `"sad and melancholic"`) and outputs a version of the audio with the mood altered while preserving the original melody structure. The ControlNet branch locks in pitch/melody via CQT features; the DiT is steered by the text prompt via cross-attention and classifier-free guidance.
 
 ## Data setup
 
@@ -21,11 +21,14 @@ data/
                                 static_annotations_averaged*.csv files)
 ```
 
-Songs are labeled by mean valence/arousal over the 15-30 s clip window
+Clips are labeled by mean **valence** over their own annotation window
 (DEAM's dynamic annotations start at 15 s, so training clips do too), mapped
-to the five mood strings used for text conditioning. Songs without
-annotations are skipped; if no annotation files are found at all, it falls
-back to the old heuristic with a warning.
+to one of two mood strings: `v > +0.1` is happy, `v < -0.1` is sad. Arousal is
+not used. Clips inside that dead band (~28% of them) are dropped rather than
+labeled — DEAM's valence ratings sit on a positive shift, so a barely-negative
+clip does not actually sound sad, and labeling it as such is what blurred the
+two classes together. Songs without annotations are skipped; if no annotation
+files are found at all, it falls back to the old heuristic with a warning.
 
 The first run decodes all mp3s and extracts melodies (~30 min), then caches
 everything to `cache/*.npz`; later runs load in seconds. Use `--no_cache` to
@@ -36,7 +39,7 @@ disable.
 ```bash
 # Full pipeline: train autoencoder -> train diffusion -> edit
 python mood_diffusion.py --mode full --audio_dir data/DEAM_audio/MEMD_audio \
-    --annotations_dir data/DEAM_Annotations --text "dark and mysterious"
+    --annotations_dir data/DEAM_Annotations --text "sad and melancholic"
 
 # Quick smoke test on a 32-song subset
 python mood_diffusion.py --mode full --n_songs 32 --diff_epochs 2000
@@ -65,7 +68,7 @@ config.py           DiffusionConfig — all hyperparameters in one place (epochs
                     model dims, diffusion schedule, CFG scale, etc.)
 
 annotations.py      DEAM valence/arousal CSV loading (dynamic + static formats)
-                    and the (valence, arousal) -> mood text mapping
+                    and the valence -> mood text mapping (happy/sad + dead band)
 
 dataset.py          build_dataset — cuts each DEAM song into 5 s clips, labels
                     each clip from its own annotation window, extracts melodies,
@@ -87,15 +90,20 @@ melody.py           MelodyExtractor — high-pass filter + CQT + top-k bin selec
                     (paper §III-B). MelodyEncoder — embeds pitch indices and downsamples
                     to match the latent temporal resolution for ControlNet injection
 
-text_encoder.py     TextEncoder — lightweight character-level transformer encoder for
-                    mood text prompts. Produces cross-attention keys/values for DiTBlock.
-                    Swap in T5-base here for production quality
+text_encoder.py     ClapTextEncoder — frozen CLAP text tower + trainable projection into
+                    DiT cross-attention tokens. Also owns the modality-gap alignment
+                    (mean-centering + Procrustes text->audio map), fitted before training
+                    and stored as buffers so every loader applies it automatically.
+                    (Legacy character-level TextEncoder kept for ablation.)
+
+mood_paraphrases.py ~60 CLAP-validated paraphrases per mood. Training samples one per
+                    step for the text path; inference/eval keep the canonical caption.
 
 train.py            train_autoencoder() — MSE training loop for the latent AE
                     train_diffusion() — v-prediction training loop for DiT+ControlNet
                     with CFG dropout on text conditioning and mood-balanced batch
-                    sampling (inverse-frequency weights, so rare moods like
-                    sad/dark get equal training signal)
+                    sampling (inverse-frequency weights, so the minority
+                    sad mood gets equal training signal)
 
 inference.py        edit_mood() — SDEdit inference: encode -> add noise to t_start ->
                     DDIM denoise with CFG (text only, melody unguided) -> decode -> BigVGAN

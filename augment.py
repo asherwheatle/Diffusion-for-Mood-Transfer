@@ -1,14 +1,14 @@
 """Waveform augmentation for balancing under-represented moods.
 
-DEAM is heavily skewed: ~5.6% of training clips are "dark and mysterious"
-versus ~54% "happy and uplifting" (a 9.6x gap), and those dark clips come
-from only ~144 distinct songs. Weighted sampling equalizes how often each
-mood is *seen*, but it can only repeat the same 605 dark clips. This module
-manufactures new, plausible dark clips by perturbing the real ones so the
-model sees genuine variety instead of the same handful over and over.
+DEAM's valence ratings sit on a positive shift, so even after the dead band
+(see annotations.VALENCE_DEAD_BAND) the happy/sad split is roughly 70/30.
+Weighted sampling equalizes how often each mood is *seen*, but it can only
+repeat the same sad clips. This module manufactures new, plausible sad clips
+by perturbing the real ones so the model sees genuine variety instead of the
+same handful over and over.
 
-Three mood-preserving perturbations (small enough not to push a clip out of
-its valence/arousal quadrant), composed per variant:
+Three mood-preserving perturbations (small enough not to push a clip across
+the valence split), composed per variant:
 
   * pitch shift   — +/- a few semitones (librosa phase-vocoder)
   * time shift    — translate the waveform in time, zero-filling the gap
@@ -87,8 +87,27 @@ def augment_waveform(wav: np.ndarray, sr: int, rng: np.random.Generator,
 
 
 def plan_augmentation(counts: dict, moods_to_aug, target=None,
-                      cap=None) -> tuple:
+                      cap=None, ratio=None) -> tuple:
     """Decide how many augmented variants each clip of a mood needs.
+
+    Two modes:
+
+    target mode (ratio=None)
+        Boost each listed mood UP TO `target` clips. Use this only when the
+        trainer samples uniformly. It necessarily augments a rare mood harder
+        than a common one, so the augmentation artifacts (pitch-shift ringing,
+        added noise) end up correlated with the rare mood's label — a
+        shortcut feature the model can learn instead of the actual mood.
+        Measured on this corpus, the artifacts alone move CLAP +0.069 toward
+        the sad caption and the valence probe -0.061.
+
+    ratio mode (ratio=r)
+        Give EVERY listed mood the same r variants per real clip, so the
+        fraction of augmented clips is identical across moods and the
+        artifacts carry no mood information. Class balance is left to the
+        trainer's weighted sampler (train.train_diffusion already draws each
+        batch with inverse-frequency weights), which is the right division of
+        labour: the sampler equalizes counts, augmentation only adds variety.
 
     Returns a *fractional* variants-per-clip figure. Because a clip can
     only get a whole number of variants, the caller applies stochastic
@@ -105,7 +124,16 @@ def plan_augmentation(counts: dict, moods_to_aug, target=None,
 
     Returns:
         (plan, target) where plan = {mood: mean_variants_per_existing_clip}.
+        In ratio mode the second element is None — there is no single target
+        count, since each mood keeps its own size.
     """
+    if ratio is not None:
+        r = float(ratio)
+        if cap is not None:
+            r = min(r, float(cap))
+        r = max(0.0, r)
+        return {mood: r for mood in moods_to_aug}, None
+
     if target is None:
         target = max(counts.values()) if counts else 0
     plan = {}
@@ -150,7 +178,7 @@ def _demo():
     ap.add_argument("--clips_per_song", type=int, default=6)
     ap.add_argument("--clip_seconds", type=float, default=5)
     ap.add_argument("--clip_start_seconds", type=float, default=15)
-    ap.add_argument("--mood", type=str, default="dark and mysterious",
+    ap.add_argument("--mood", type=str, default="sad and melancholic",
                     help="mood to balance (repeatable via comma)")
     ap.add_argument("--target", type=int, default=None,
                     help="target clip count (default: match largest mood)")
@@ -167,14 +195,20 @@ def _demo():
     va = load_annotation_windows(args.annotations_dir, windows)
 
     counts = Counter()
+    dropped = 0
     for pairs in va.values():
         for v, a in pairs:
-            counts[mood_from_va(v, a)] += 1
+            mood = mood_from_va(v)
+            if mood is None:      # inside the valence dead band
+                dropped += 1
+                continue
+            counts[mood] += 1
 
     moods = [m.strip() for m in args.mood.split(",")]
     plan, target = plan_augmentation(counts, moods, args.target, args.cap)
 
-    print(f"\nCurrent per-clip counts ({sum(counts.values())} clips):")
+    print(f"\nCurrent per-clip counts ({sum(counts.values())} clips, "
+          f"{dropped} dropped in the valence dead band):")
     for m, c in counts.most_common():
         print(f"  {c:6d}  {m}")
     print(f"\nBalancing target: {target} clips/mood")

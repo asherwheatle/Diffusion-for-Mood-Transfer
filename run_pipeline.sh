@@ -9,7 +9,7 @@
 #SBATCH --job-name=mood-diffusion-full
 #SBATCH --output=logs/mood_full_%j.out
 #SBATCH --error=logs/mood_full_%j.err
-#SBATCH --partition=hpg-turin
+#SBATCH --partition=hpg-b200
 #SBATCH --account=ufdatastudios
 #SBATCH --qos=ufdatastudios
 # Single-GPU training. Extra CPUs feed the pinned-memory DataLoader workers
@@ -17,8 +17,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus=1
-#SBATCH --mem=64G
+#SBATCH --gpus=b200:1
+#SBATCH --mem=80G
 #SBATCH --time=24:00:00
 #SBATCH --mail-user=asherwheatle@ufl.edu
 #SBATCH --mail-type=ALL
@@ -62,6 +62,24 @@ uv sync
 source "$UV_PROJECT_ENVIRONMENT/bin/activate"
 
 # ---------------------------------------------------------------------------
+# 4b. Ensure CLAP (and its torchvision dep) are installed. The diffusion phase
+#     builds a CLAP text encoder; laion_clap imports torchvision, which isn't
+#     pulled by `uv sync`. Runs after the sync so it self-heals if sync prunes
+#     it. (Mirrors run_eval.sh — keep the two in step.)
+# ---------------------------------------------------------------------------
+CLAP_CKPT="music_audioset_epoch_15_esc_90.14.pt"
+python -c "import laion_clap" 2>/dev/null || {
+    echo "[SETUP] Installing laion-clap + torchvision..."
+    # torchvision 0.22.0 matches torch 2.7.0/cu128; laion_clap imports it
+    uv pip install "torchvision==0.22.0" --index-url https://download.pytorch.org/whl/cu128
+    uv pip install laion-clap
+}
+if [ ! -f "$CLAP_CKPT" ]; then
+    echo "[SETUP] Downloading CLAP music checkpoint..."
+    wget -q "https://huggingface.co/lukewys/laion_clap/resolve/main/$CLAP_CKPT"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Create output and log directories
 # ---------------------------------------------------------------------------
 mkdir -p logs output
@@ -84,10 +102,22 @@ mkdir -p logs output
 
 # ---------------------------------------------------------------------------
 # 7. Run the pipeline
-#    Each job gets its own output directory keyed by SLURM job ID,
+#    Default: each job gets its own output directory keyed by SLURM job ID,
 #    so concurrent runs never clobber each other's results.
+#
+#    Resume: pass an existing output dir as the first argument to reuse its
+#    checkpoints instead of starting fresh, e.g.
+#        sbatch run_pipeline.sh output/job_40998207
+#    Training then picks up from that dir's *_ckpt.pt — a completed autoencoder
+#    (epoch == ae_epochs) is skipped and the run goes straight to diffusion.
 # ---------------------------------------------------------------------------
-OUTPUT_DIR="output/job_${SLURM_JOB_ID}"
+RESUME_DIR="${1:-}"            # ${1:-} keeps this safe under `set -u`
+if [ -n "$RESUME_DIR" ]; then
+    OUTPUT_DIR="$RESUME_DIR"
+    echo "[RUN] Resuming into existing output dir: $OUTPUT_DIR"
+else
+    OUTPUT_DIR="output/job_${SLURM_JOB_ID}"
+fi
 mkdir -p "$OUTPUT_DIR"
 
 echo "[RUN] Starting pipeline on $(date)"

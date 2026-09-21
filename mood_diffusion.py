@@ -23,7 +23,7 @@ Usage:
 
   # Phase 3: Edit mood of an audio file
   python mood_diffusion.py --mode edit --input output/original.wav \
-      --text "dark and mysterious" --edit_strength 0.7
+      --text "sad and melancholic" --edit_strength 0.7
 
   # Full pipeline (train_ae -> train_diff -> edit)
   python mood_diffusion.py --mode full --audio_dir data/DEAM_audio/MEMD_audio
@@ -40,7 +40,7 @@ from config import DiffusionConfig
 from autoencoder import LatentAutoencoder
 from dit import MoodDiT
 from melody import MelodyEncoder, MelodyExtractor
-from text_encoder import ClapTextEncoder
+from text_encoder import ClapTextEncoder, load_clap_text_model
 from diffusion import GaussianDiffusion
 from train import train_autoencoder, train_diffusion
 from inference import edit_mood
@@ -66,7 +66,7 @@ def parse_args():
                         default=os.path.join("data", "DEAM_audio", "MEMD_audio"))
     parser.add_argument("--input", type=str, default=None,
                         help="Input WAV for edit mode")
-    parser.add_argument("--text", type=str, default="dark and mysterious",
+    parser.add_argument("--text", type=str, default="sad and melancholic",
                         help="Mood description for editing")
     parser.add_argument("--edit_strength", type=float, default=0.35,
                         help="0=no change, 1=full regen from noise")
@@ -157,14 +157,28 @@ def main():
             hop_length=cfg.cqt_hop, fmin=cfg.cqt_fmin,
             top_k=cfg.melody_top_k, highpass_cutoff=cfg.highpass_cutoff,
         )
-        mel_batch, melodies, mood_texts, names = build_dataset(
+        # Conditioning on per-clip CLAP audio embeddings needs CLAP during the
+        # dataset pass. Build it once here and hand the same frozen module to
+        # train_diffusion so it isn't loaded (~2 GB) twice.
+        clap_model = clap_embedder = None
+        if getattr(cfg, "clap_cond_source", "text") == "audio":
+            print("[STEP 4] Loading CLAP for audio-embedding conditioning...")
+            clap_model = load_clap_text_model(cfg.clap_ckpt, cfg.device)
+            _clap_enc = ClapTextEncoder(
+                cfg.d_model, clap_model=clap_model,
+                n_tokens=cfg.text_n_tokens, device=cfg.device)
+            clap_embedder = _clap_enc.encode_audio
+
+        mel_batch, melodies, mood_texts, names, clap_audio = build_dataset(
             args.audio_dir, cfg.n_train_songs, bigvgan_model,
             cfg.clip_seconds, annotations_dir=cfg.annotations_dir,
             clip_start_seconds=cfg.clip_start_seconds,
             melody_extractor=extractor, cache_dir=cfg.cache_dir,
+            clap_embedder=clap_embedder,
             clips_per_song=cfg.clips_per_song,
             augment_moods=cfg.augment_moods,
             augment_target=cfg.augment_target,
+            augment_ratio=getattr(cfg, "augment_ratio", None),
             max_aug_per_clip=cfg.max_aug_per_clip,
             aug_max_semitones=cfg.aug_max_semitones,
             aug_max_shift_frac=cfg.aug_max_shift_frac,
@@ -217,7 +231,8 @@ def main():
 
         print("\n[PHASE 2] Training diffusion model...")
         dit, melody_enc, text_enc, diffusion, latent_stats = train_diffusion(
-            ae, mel_batch, melodies, mood_texts, cfg
+            ae, mel_batch, melodies, mood_texts, cfg,
+            clap_audio=clap_audio, clap_model=clap_model,
         )
         latent_mean, latent_std = latent_stats
 
@@ -228,6 +243,12 @@ def main():
             "text_enc": text_enc.state_dict(),
             "latent_mean": latent_mean,
             "latent_std": latent_std,
+            "clap_cond_source": getattr(cfg, "clap_cond_source", "text"),
+            # Provenance only; the alignment itself is in text_enc's buffers.
+            "clap_align": (getattr(cfg, "clap_align", "none")
+                           if getattr(cfg, "clap_cond_source", "text") == "audio"
+                           else "none"),
+            "clap_text_paraphrases": getattr(cfg, "clap_text_paraphrases", False),
         }, diff_path)
         print(f"  Saved diffusion model: {diff_path}")
 

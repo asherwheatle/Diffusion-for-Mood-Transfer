@@ -1,9 +1,9 @@
 """Dry-run mood distribution counter.
 
 Replicates the labelling half of `build_dataset` — the same 6 windows,
-the same per-window valence/arousal averaging, the same mood mapping —
-without decoding any audio or building mels/melodies. Use it to see how
-many clips of each mood a retrain will actually use.
+the same per-window valence averaging, the same happy/sad mapping and the
+same dead-band drop — without decoding any audio or building mels/melodies.
+Use it to see how many clips of each mood a retrain will actually use.
 
     python3 count_moods.py --audio_dir data/DEAM_audio/MEMD_audio
 
@@ -23,7 +23,7 @@ from collections import Counter
 # annotations.py is numpy-only; we avoid importing config.py so this dry
 # run needs no torch. Defaults below mirror config.DiffusionConfig.
 from annotations import (load_annotation_windows, mood_from_va,
-                         song_id_from_filename)
+                         song_id_from_filename, VALENCE_DEAD_BAND)
 
 
 def main():
@@ -62,37 +62,44 @@ def main():
         va = {sid: pairs for sid, pairs in va.items() if sid in present}
         print(f"[COUNT] {len(va)}/{before} annotated songs have audio present")
 
-    # Per-clip mood counts, plus which window index each mood comes from
+    # Per-clip mood counts, plus which window index each mood comes from.
+    # Clips inside the valence dead band have no mood; they are counted
+    # separately because build_dataset drops them entirely.
     clip_moods = Counter()
     per_window = [Counter() for _ in range(args.clips_per_song)]
-    song_moods = Counter()          # mood of each song's averaged window-0 clip
+    dropped_per_window = [0] * args.clips_per_song
+    n_total = 0
     for sid, pairs in va.items():
         for k, (v, a) in enumerate(pairs):
-            mood = mood_from_va(v, a)
+            n_total += 1
+            mood = mood_from_va(v)
+            if mood is None:
+                dropped_per_window[k] += 1
+                continue
             clip_moods[mood] += 1
             per_window[k][mood] += 1
-        # song-level view: mood of the first window, for comparison
-        v0, a0 = pairs[0]
-        song_moods[mood_from_va(v0, a0)] += 1
 
+    n_dropped = sum(dropped_per_window)
     n_clips = sum(clip_moods.values())
-    print(f"\n=== Per-CLIP distribution ({n_clips} clips, "
-          f"{len(va)} songs x up to {args.clips_per_song}) ===")
+    print(f"\n=== Per-CLIP distribution ({n_clips} labeled of {n_total} "
+          f"clips, {len(va)} songs x up to {args.clips_per_song}) ===")
     for mood, c in clip_moods.most_common():
         print(f"  {c:6d}  ({100*c/n_clips:4.1f}%)  {mood}")
+    print(f"  {n_dropped:6d}  ({100*n_dropped/n_total:4.1f}% of all clips)  "
+          f"DROPPED: |valence| < {VALENCE_DEAD_BAND:g}")
 
-    dark = clip_moods.get("dark and mysterious", 0)
-    print(f"\nDark clips: {dark}  ({100*dark/n_clips:.1f}% of all clips)")
-    if dark:
-        maj = clip_moods.most_common(1)[0]
-        print(f"Imbalance vs largest mood ({maj[0]}): "
-              f"{maj[1]/dark:.1f}x")
+    if len(clip_moods) > 1:
+        (maj, maj_n), (mino, min_n) = (clip_moods.most_common()[0],
+                                       clip_moods.most_common()[-1])
+        print(f"\nImbalance {maj} vs {mino}: {maj_n/min_n:.1f}x")
 
-    print("\n=== Dark clips by window position (are they spread out?) ===")
+    print("\n=== By window position (are the labels spread out?) ===")
     for k in range(args.clips_per_song):
         s = k * args.clip_seconds + args.clip_start_seconds
+        kept = ", ".join(f"{m.split()[0]} {per_window[k][m]}"
+                         for m, _ in clip_moods.most_common())
         print(f"  window {k} ({s:.0f}-{s+args.clip_seconds:.0f}s): "
-              f"{per_window[k].get('dark and mysterious', 0)} dark")
+              f"{kept}, dropped {dropped_per_window[k]}")
 
 
 if __name__ == "__main__":

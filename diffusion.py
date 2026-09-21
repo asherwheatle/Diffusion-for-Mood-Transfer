@@ -63,9 +63,28 @@ class GaussianDiffusion:
         return sqrt_omab * x_t + sqrt_ab * v
 
     def ddim_step(self, x_t: torch.Tensor, v: torch.Tensor,
-                  t: torch.Tensor, t_prev: torch.Tensor) -> torch.Tensor:
+                  t: torch.Tensor, t_prev: torch.Tensor,
+                  eta: float = 0.0) -> torch.Tensor:
+        """One DDIM step from t to t_prev.
+
+        eta=0 (default) is the deterministic DDIM update. eta>0 injects the
+        ancestral noise term, which matters for SDEdit: a fully deterministic
+        trajectory started from a lightly-noised input tends to retrace that
+        input, leaving the conditioning little room to move it. eta=1 recovers
+        DDPM-style ancestral sampling.
+        """
         x0_pred = self.predict_x0_from_v(x_t, v, t)
         eps_pred = self.predict_eps_from_v(x_t, v, t)
+        ab = self.alpha_bar[t].view(-1, 1, 1, 1)
+        ab_prev = self.alpha_bar[t_prev].view(-1, 1, 1, 1)
         sqrt_ab_prev = self.sqrt_alpha_bar[t_prev].view(-1, 1, 1, 1)
-        sqrt_omab_prev = self.sqrt_one_minus_alpha_bar[t_prev].view(-1, 1, 1, 1)
-        return sqrt_ab_prev * x0_pred + sqrt_omab_prev * eps_pred
+
+        if eta == 0.0:
+            sqrt_omab_prev = self.sqrt_one_minus_alpha_bar[t_prev].view(-1, 1, 1, 1)
+            return sqrt_ab_prev * x0_pred + sqrt_omab_prev * eps_pred
+
+        sigma = eta * torch.sqrt(torch.clamp(
+            (1 - ab_prev) / (1 - ab) * (1 - ab / ab_prev), min=0.0))
+        dir_coef = torch.sqrt(torch.clamp(1 - ab_prev - sigma ** 2, min=0.0))
+        x_prev = sqrt_ab_prev * x0_pred + dir_coef * eps_pred
+        return x_prev + sigma * torch.randn_like(x_t)
