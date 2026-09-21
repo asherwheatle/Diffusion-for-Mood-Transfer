@@ -52,6 +52,8 @@ import csv
 import glob
 import argparse
 
+from collections import Counter
+
 import numpy as np
 import torch
 import librosa
@@ -201,7 +203,8 @@ def load_models(cfg: DiffusionConfig, ckpt_dir: str, sample_wav: np.ndarray,
 
 
 def pick_annotated_songs(audio_dir: str, va: dict, n: int,
-                         require_label: bool = True) -> list:
+                         require_label: bool = True,
+                         balanced: bool = False) -> list:
     """Return n song file paths (spread evenly) that have VA annotations.
 
     With require_label (the default), songs inside the valence dead band —
@@ -209,6 +212,14 @@ def pick_annotated_songs(audio_dir: str, va: dict, n: int,
     every mood-scoring stage can assume a usable ground truth. The valence
     probe passes require_label=False: it regresses on continuous valence and
     wants the middle of the range in its training set.
+
+    With balanced, take n/len(MOODS) songs per ground-truth mood instead of
+    spreading evenly over the whole corpus. DEAM leans positive (~70/30 even
+    after the dead band), so the even spread inherits that skew — a 20-song
+    pick came out 16 happy / 4 sad, which left the sad->happy edit direction
+    resting on 4 songs. Edit evaluation wants both directions tested equally;
+    CLAP validation and the probe do not, since they measure the judges
+    against the corpus as it really is.
     """
     files = sorted(glob.glob(os.path.join(audio_dir, "*.mp3")))
     files = [f for f in files if song_id_from_filename(f) in va]
@@ -217,10 +228,27 @@ def pick_annotated_songs(audio_dir: str, va: dict, n: int,
                  if mood_from_va(*va[song_id_from_filename(f)]) is not None]
     if not files:
         raise FileNotFoundError(f"No annotated MP3s found in {audio_dir}")
-    if n < len(files):
-        idxs = np.unique(np.linspace(0, len(files) - 1, n).astype(int))
-        files = [files[i] for i in idxs]
-    return files
+
+    def _spread(pool, k):
+        if k >= len(pool):
+            return list(pool)
+        idxs = np.unique(np.linspace(0, len(pool) - 1, k).astype(int))
+        return [pool[i] for i in idxs]
+
+    if balanced and require_label:
+        per_mood = max(1, n // len(MOODS))
+        picked = []
+        for m in MOODS:
+            pool = [f for f in files
+                    if mood_from_va(*va[song_id_from_filename(f)]) == m]
+            got = _spread(pool, per_mood)
+            if len(got) < per_mood:
+                print(f"[PICK] WARNING: only {len(got)} songs available for "
+                      f"'{m}', wanted {per_mood} — the split is not balanced.")
+            picked += got
+        return sorted(picked)
+
+    return _spread(files, n)
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +294,50 @@ def validate_clap(clap: Clap, files: list, va: dict, sr: int,
 
 
 # ---------------------------------------------------------------------------
+# Stage 1c: how far apart are REAL songs of each mood? (the yardstick)
+# ---------------------------------------------------------------------------
+def measure_mood_gap(clap: Clap, files: list, va: dict, sr: int,
+                     start_s: float, dur_s: float) -> dict:
+    """Mean mood-axis position of real clips of each mood.
+
+    Only meaningful for a two-mood vocabulary, which is what this project
+    uses. The axis is cos(x, MOODS[1]) - cos(x, MOODS[0]) — for the
+    happy/sad split, "how much more this sounds sad than happy".
+
+    The gap between the two means is the scale a mood EDIT should be read
+    against: an edit that moves a song a tenth of the distance between real
+    happy and real sad music has barely changed its mood, however reliably
+    positive its margin is. Without this, margins have no units.
+    """
+    if len(MOODS) != 2:
+        return {}
+    print(f"\n{'='*60}\n MOOD-AXIS YARDSTICK on {len(files)} real clips\n{'='*60}")
+    per_mood = {m: [] for m in MOODS}
+    for path in files:
+        gt = mood_from_va(*va[song_id_from_filename(path)])
+        if gt not in per_mood:
+            continue
+        cos = clap.cos_to_moods(clap.audio_embed(
+            load_clip(path, sr, start_s, dur_s), sr))
+        per_mood[gt].append(float(cos[1] - cos[0]))
+    out = {}
+    for m, vals in per_mood.items():
+        if vals:
+            out[m] = (float(np.mean(vals)), float(np.std(vals, ddof=1))
+                      if len(vals) > 1 else float("nan"), len(vals))
+            print(f" {m:24s} n={out[m][2]:3d}  axis mean {out[m][0]:+.4f}  "
+                  f"sd {out[m][1]:.4f}")
+    if len(out) == 2:
+        gap = out[MOODS[1]][0] - out[MOODS[0]][0]
+        var = sum(out[m][1] ** 2 / out[m][2] for m in out)
+        out["gap"] = (gap, float(np.sqrt(var)))
+        print(f" REAL GAP between the two moods : {gap:+.4f} "
+              f"+/- {2*np.sqrt(var):.4f} (2 SE)")
+        print(" An edit's mood change is reported as a percentage of this.")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Stage 2: edit N songs x every mood, score each edit
 # ---------------------------------------------------------------------------
 def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
@@ -305,6 +377,11 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
                   "valence_target_sign", "valence_correct_dir",
                   "valence_correct_dir_margin",
                   "cfg_scale", "edit_strength"]
+    # Full cosine vector of each edit, one column per mood. Storing these
+    # (not just the cosine toward the edit's own target) makes the mood-axis
+    # separation directly computable from the CSV afterwards.
+    cos_cols = [f"cos_to_{m.split()[0]}" for m in MOODS]
+    fieldnames += cos_cols
     rows = []
     print(f"\n{'='*60}\n EDIT EVALUATION: {len(files)} songs x {len(MOODS)} "
           f"moods = {len(files)*len(MOODS)} edits\n{'='*60}")
@@ -368,6 +445,8 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
                 "valence_correct_dir": int(v_shift * desired > 0),
                 "cfg_scale": cfg.cfg_scale,
                 "edit_strength": cfg.edit_strength,
+                **{c: round(float(edit_cos[j]), 4)
+                   for j, c in enumerate(cos_cols)},
             })
 
         # Margins need every target's edit of this song, hence computed here.
@@ -416,7 +495,48 @@ def _per_song_effect(rows, key, signed=False):
     return float(np.mean(per_song)), se, n
 
 
-def summarize(rows, clap_acc, probe, out_txt):
+def _axis_separation(rows):
+    """Per song: how far apart its two edits land on the mood axis.
+
+    axis(x) = cos(x, MOODS[1]) - cos(x, MOODS[0]); separation is
+    axis(edit toward MOODS[1]) - axis(edit toward MOODS[0]). Same form as
+    the real-song gap from measure_mood_gap, so the two are comparable and
+    their ratio answers "how much of a real mood difference did we get?".
+    """
+    if len(MOODS) != 2:
+        return None
+    lo, hi = (f"cos_to_{m.split()[0]}" for m in MOODS)
+    by_song = {}
+    for r in rows:
+        by_song.setdefault(r["song"], {})[r["target_mood"]] = r
+    seps = []
+    for song, d in by_song.items():
+        if len(d) != 2:
+            continue
+        a0, a1 = (d[m][hi] - d[m][lo] for m in MOODS)
+        seps.append(a1 - a0)
+    if not seps:
+        return None
+    n = len(seps)
+    se = float(np.std(seps, ddof=1) / np.sqrt(n)) if n >= 2 else float("inf")
+    return float(np.mean(seps)), se, n
+
+
+def _transfer_split(rows):
+    """Transfer success split by whether the edit was asked to CHANGE mood.
+
+    An edit whose target equals the song's own mood needs no change at all,
+    so counting it as a transfer success inflates the headline. Only the
+    cross-mood edits test the conditioning.
+    """
+    cross = [r for r in rows if r["target_mood"] != r["gt_mood"]]
+    same = [r for r in rows if r["target_mood"] == r["gt_mood"]]
+    f = lambda rs: (100 * float(np.mean([r["transfer_success"] for r in rs]))
+                    if rs else float("nan"), len(rs))
+    return f(cross), f(same)
+
+
+def summarize(rows, clap_acc, probe, out_txt, mood_gap=None):
     pm = probe.metrics
     chance = 1 / len(MOODS)
     lines = ["=" * 72, " EVALUATION SUMMARY", "=" * 72,
@@ -471,6 +591,36 @@ def summarize(rows, clap_acc, probe, out_txt):
         if mean < -2 * se:
             return "NEGATIVE (> 2 SE)"
         return "not distinguishable from zero"
+
+    # ---- How BIG is the mood change, in units of a real mood difference? ----
+    sep = _axis_separation(rows)
+    if sep is not None:
+        s_mean, s_se, s_n = sep
+        lines += ["", " MOOD CHANGE MAGNITUDE (the 'is this a major change?' test)",
+                  f"   a song's two edits land  : {s_mean:+.4f} +/- {2*s_se:.4f}"
+                  f" apart on the mood axis (n={s_n})"]
+        if mood_gap and "gap" in mood_gap:
+            g, g_se = mood_gap["gap"]
+            pct = 100 * s_mean / g if g else float("nan")
+            lo = 100 * (s_mean - 2*s_se) / (g + 2*g_se) if g else float("nan")
+            hi = 100 * (s_mean + 2*s_se) / max(g - 2*g_se, 1e-6) if g else float("nan")
+            lines += [f"   real happy-vs-sad gap    : {g:+.4f} +/- {2*g_se:.4f}",
+                      f"   => EDIT REACHES {pct:.0f}% OF A REAL MOOD DIFFERENCE"
+                      f"  (range {lo:.0f}-{hi:.0f}%)",
+                      "   100% = the two edits differ as much as real happy and",
+                      "   real sad music do. Well under that means the mood was",
+                      "   nudged, not changed, however positive the margin is."]
+        else:
+            lines.append("   (no real-song yardstick measured; run with "
+                         "--n_gap > 0 to put this in units)")
+
+    # ---- Transfer, split by whether a change was actually asked for ----
+    (tr_cross, n_cross), (tr_same, n_same) = _transfer_split(rows)
+    lines += ["",
+              f" Transfer, edits asked to CHANGE mood : {tr_cross:.1f}% "
+              f"(n={n_cross})  <- the real test",
+              f" Transfer, edits asked to KEEP   mood : {tr_same:.1f}% "
+              f"(n={n_same})  <- preservation, not transfer"]
 
     lines += ["",
               f" Overall CLAP margin        : {cm:+.4f} +/- {2*cm_se:.4f} (2 SE, "
@@ -539,6 +689,14 @@ def main():
     p.add_argument("--n_probe", type=int, default=500,
                    help="Annotated songs to fit the valence probe on "
                         "(cheap: CLAP-embed only, no editing)")
+    p.add_argument("--n_gap", type=int, default=80,
+                   help="Real songs (balanced across moods) used to measure "
+                        "the happy-vs-sad gap that edit magnitude is reported "
+                        "as a percentage of. 0 disables. Cheap: embed only.")
+    p.add_argument("--unbalanced_songs", action="store_true",
+                   help="Pick edit songs by even spread over the corpus "
+                        "(the old behaviour, which inherits DEAM's ~70/30 "
+                        "skew) instead of balancing across moods.")
     p.add_argument("--edit_strength", type=float, default=0.5)
     p.add_argument("--cfg_scale", type=float, default=None,
                    help="Override cfg.cfg_scale (default: the config value). "
@@ -583,8 +741,22 @@ def main():
         load_clip, song_id_from_filename,
         cache_path=os.path.join(args.ckpt_dir, "valence_probe.npz"))
 
-    # Stage 2: load the model and evaluate edits
-    edit_files = pick_annotated_songs(args.audio_dir, va, args.n_songs)
+    # Stage 1c: the yardstick — how far apart are REAL songs of each mood?
+    mood_gap = {}
+    if args.n_gap > 0 and len(MOODS) == 2:
+        gap_files = pick_annotated_songs(args.audio_dir, va, args.n_gap,
+                                         balanced=True)
+        mood_gap = measure_mood_gap(clap, gap_files, va, sr,
+                                    cfg.clip_start_seconds, cfg.clip_seconds)
+
+    # Stage 2: load the model and evaluate edits. Balanced by default so both
+    # edit directions get equal weight; DEAM's skew otherwise leaves the
+    # minority->majority direction resting on a handful of songs.
+    edit_files = pick_annotated_songs(args.audio_dir, va, args.n_songs,
+                                      balanced=not args.unbalanced_songs)
+    gt_counts = Counter(mood_from_va(*va[song_id_from_filename(f)])
+                        for f in edit_files)
+    print(f"[EVAL] Edit songs by ground-truth mood: {dict(gt_counts)}")
     sample = load_clip(edit_files[0], sr, cfg.clip_start_seconds, cfg.clip_seconds)
     print("[STEP] Loading mood-diffusion checkpoints...")
     models = load_models(cfg, args.ckpt_dir, sample, _bigvgan, clap=clap)
@@ -593,7 +765,8 @@ def main():
                           os.path.join(args.ckpt_dir, "eval_edits.csv"),
                           seed=args.seed)
     summarize(rows, clap_acc, probe,
-              os.path.join(args.ckpt_dir, "eval_summary.txt"))
+              os.path.join(args.ckpt_dir, "eval_summary.txt"),
+              mood_gap=mood_gap)
 
 
 if __name__ == "__main__":
