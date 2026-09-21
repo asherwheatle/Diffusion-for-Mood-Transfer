@@ -1,3 +1,9 @@
+# Project Background
+
+This model's architecture is based on **Hou, S., et al. (2024), "Editing music with melody and text: Using ControlNet for diffusion transformer," arXiv:2410.05151** — a Diffusion Transformer (DiT) paired with a ControlNet branch for melody-preserving, text-guided music editing.
+
+This repo rebuilds that design with three additions (see [paper/methodology.md](paper/methodology.md) for full details): a compact mel-spectrogram latent space, mood conditioning via CLAP audio/text embeddings, and an explicit correction for the modality gap between CLAP's audio and text embedding spaces. The referenced results table (`Ours w/ cross attention`, `Ours w/o masking strategy`, `Ours`, vs. `MusicGen-stereo-melody` baselines on FD, KL, CLAP score, melody accuracy) is from Hou et al.'s original ablations, which this project's `evaluate.py` metrics are modeled after.
+
 # Version Control Instructions
 
 After **every** edit you (Claude) make to this codebase — creating, modifying, or deleting any file — commit and push the change immediately, without waiting for the user to ask. Do this at the end of the turn in which the edit was made, or immediately after each logical edit if a turn contains several unrelated changes.
