@@ -16,6 +16,53 @@ from pipeline import bigvgan_mel_spectrogram, FixedMelNormalizer, pad_spectrogra
 
 
 @torch.no_grad()
+def reconstruct(
+    waveform: torch.Tensor,
+    ae: LatentAutoencoder,
+    bigvgan_model,
+    cfg: DiffusionConfig,
+) -> torch.Tensor:
+    """Round-trip audio through the autoencoder + vocoder with NO diffusion.
+
+    This is the reconstruction control for evaluation. Every edit produced by
+    `edit_mood` pays a resynthesis cost — mel -> encoder -> decoder -> BigVGAN
+    lowers CLAP cosine to *any* caption and shifts the valence probe, because
+    both judges were fit on real audio and have never seen vocoded audio. That
+    cost is a property of the codec, not of the mood edit.
+
+    Comparing an edit against this output instead of against the raw input
+    subtracts the cost, so what is left is attributable to the conditioning.
+    The path below mirrors `edit_mood` exactly except that the latent goes
+    straight from encoder to decoder: the latent standardization round-trip is
+    the identity here, so it is omitted.
+
+    Returns:
+        wav_out: (1, T_samples) reconstructed waveform tensor
+    """
+    device = cfg.device
+
+    mel = bigvgan_mel_spectrogram(waveform, bigvgan_model)
+    normalizer = FixedMelNormalizer()
+    mel_norm = normalizer.normalize(mel)
+    mel_padded, orig_hw = pad_spectrogram(mel_norm.unsqueeze(0))
+    mel_padded = mel_padded.to(device)
+
+    z0 = ae.encoder(mel_padded)
+    recon_mel_norm = ae.decoder(z0)
+    if recon_mel_norm.shape != mel_padded.shape:
+        recon_mel_norm = F.interpolate(
+            recon_mel_norm, size=mel_padded.shape[2:],
+            mode="bilinear", align_corners=False
+        )
+    recon_mel_norm = unpad_spectrogram(recon_mel_norm, orig_hw)
+    recon_mel = normalizer.denormalize(recon_mel_norm.squeeze(0).cpu())
+
+    with torch.inference_mode():
+        wav_out = bigvgan_model(recon_mel.to(device))
+    return wav_out.squeeze(0).cpu().clamp(-1.0, 1.0)
+
+
+@torch.no_grad()
 def edit_mood(
     waveform: torch.Tensor,
     mood_text: str,

@@ -50,7 +50,7 @@ from text_encoder import ClapTextEncoder
 from diffusion import GaussianDiffusion
 from pipeline import (load_bigvgan, bigvgan_mel_spectrogram, FixedMelNormalizer,
                       pad_spectrogram)
-from inference import edit_mood
+from inference import edit_mood, reconstruct
 from annotations import (load_annotations, mood_from_va, song_id_from_filename,
                          MOOD_PROMPTS)
 from valence_probe import (train_probe_from_clip_files, MOOD_VALENCE_SIGN)
@@ -254,19 +254,41 @@ def validate_clap(clap: Clap, files: list, va: dict, sr: int,
 # ---------------------------------------------------------------------------
 # Stage 2: edit N songs x every mood, score each edit
 # ---------------------------------------------------------------------------
-def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv):
+def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
+    """Edit every song toward every mood and score each edit.
+
+    Each edit is scored three ways, in increasing order of trustworthiness:
+
+      *_original  vs the raw input clip. Confounded: the edit also paid the
+                  autoencoder+vocoder resynthesis cost, which lowers CLAP
+                  cosine to every caption and drags the valence probe down,
+                  because both judges were fit on real audio.
+      *_recon     vs the same clip round-tripped through the codec with no
+                  diffusion (inference.reconstruct). Subtracts that cost.
+      *_margin    vs this song's *other* mood edits. Cancels everything the
+                  edits share — codec, song, and noise — leaving only what the
+                  conditioning text changed. This is the primary metric, and
+                  it mirrors probe_conditioning.cond_margin.
+
+    Sampling noise is fixed per song (the seed is reset before every mood), so
+    within a song the only thing that differs between edits is the text.
+    """
     ae, dit, melody_enc, text_enc, diffusion, lat_mean, lat_std = models
     fieldnames = ["song", "song_id", "gt_mood", "target_mood",
-                  "clap_cos_original", "clap_cos_edited", "clap_gain",
-                  "clap_pred_edited", "transfer_success", "chroma_sim",
-                  "valence_original", "valence_edited", "valence_shift",
+                  "clap_cos_original", "clap_cos_recon", "clap_cos_edited",
+                  "clap_gain", "clap_gain_recon", "clap_margin",
+                  "clap_pred_edited", "transfer_success",
+                  "chroma_sim", "chroma_recon",
+                  "valence_original", "valence_recon", "valence_edited",
+                  "valence_shift", "valence_shift_recon", "valence_margin",
                   "valence_target_sign", "valence_correct_dir",
-                  "edit_strength"]
+                  "valence_correct_dir_margin",
+                  "cfg_scale", "edit_strength"]
     rows = []
     print(f"\n{'='*60}\n EDIT EVALUATION: {len(files)} songs x {len(MOODS)} "
           f"moods = {len(files)*len(MOODS)} edits\n{'='*60}")
 
-    for path in files:
+    for si, path in enumerate(files):
         sid = song_id_from_filename(path)
         gt = mood_from_va(*va[sid])
         wav_orig = load_clip(path, sr, cfg.clip_start_seconds, cfg.clip_seconds)
@@ -276,7 +298,18 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv):
         orig_cos = clap.cos_to_moods(orig_emb)  # (n_moods,)
         v_orig = probe.predict(orig_emb)
 
+        # Reconstruction control: the codec cost with no mood edit at all.
+        wav_recon = reconstruct(waveform, ae, _bigvgan, cfg).squeeze(0).numpy()
+        recon_emb = clap.audio_embed(wav_recon, sr)
+        recon_cos = clap.cos_to_moods(recon_emb)
+        v_recon = probe.predict(recon_emb)
+        chroma_recon = chroma_similarity(wav_orig, wav_recon, sr)
+
+        song_seed = seed + si
+        song_rows, cos_by_target, v_by_target = [], {}, {}
         for target in MOODS:
+            # SAME noise for every mood of this song => only the text differs.
+            torch.manual_seed(song_seed)
             wav_edit = edit_mood(
                 waveform, target, ae, dit, melody_enc, text_enc, diffusion,
                 _bigvgan, cfg, lat_mean, lat_std,
@@ -290,24 +323,48 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv):
             v_edit = probe.predict(edit_emb)
             v_shift = v_edit - v_orig
             desired = MOOD_VALENCE_SIGN[target]
-            rows.append({
+            cos_by_target[target] = edit_cos
+            v_by_target[target] = v_edit
+            song_rows.append({
                 "song": os.path.basename(path), "song_id": sid, "gt_mood": gt,
                 "target_mood": target,
                 "clap_cos_original": round(float(orig_cos[ti]), 4),
+                "clap_cos_recon": round(float(recon_cos[ti]), 4),
                 "clap_cos_edited": round(float(edit_cos[ti]), 4),
                 "clap_gain": round(float(edit_cos[ti] - orig_cos[ti]), 4),
+                "clap_gain_recon": round(float(edit_cos[ti] - recon_cos[ti]), 4),
                 "clap_pred_edited": pred,
                 "transfer_success": int(pred == target),
                 "chroma_sim": round(chroma_similarity(wav_orig, wav_edit, sr), 4),
+                "chroma_recon": round(float(chroma_recon), 4),
                 "valence_original": round(float(v_orig), 4),
+                "valence_recon": round(float(v_recon), 4),
                 "valence_edited": round(float(v_edit), 4),
                 "valence_shift": round(float(v_shift), 4),
+                "valence_shift_recon": round(float(v_edit - v_recon), 4),
                 "valence_target_sign": desired,
                 # did valence move in the target's intended direction?
                 "valence_correct_dir": int(v_shift * desired > 0),
+                "cfg_scale": cfg.cfg_scale,
                 "edit_strength": cfg.edit_strength,
             })
-        print(f"  {os.path.basename(path)} (gt={gt}) done")
+
+        # Margins need every target's edit of this song, hence computed here.
+        # Subtracting the sibling mean removes the codec cost, the song, and
+        # the noise, all of which are shared across this song's edits.
+        v_sibling_mean = float(np.mean([v_by_target[m] for m in MOODS]))
+        for r in song_rows:
+            ti = MOODS.index(r["target_mood"])
+            cos_sibling_mean = float(np.mean([cos_by_target[m][ti]
+                                              for m in MOODS]))
+            r["clap_margin"] = round(
+                float(cos_by_target[r["target_mood"]][ti] - cos_sibling_mean), 4)
+            v_margin = v_by_target[r["target_mood"]] - v_sibling_mean
+            r["valence_margin"] = round(float(v_margin), 4)
+            r["valence_correct_dir_margin"] = int(
+                v_margin * r["valence_target_sign"] > 0)
+        rows += song_rows
+        print(f"  {os.path.basename(path)} (gt={gt}) done  [{si+1}/{len(files)}]")
 
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -381,6 +438,12 @@ def main():
                    help="Annotated songs to fit the valence probe on "
                         "(cheap: CLAP-embed only, no editing)")
     p.add_argument("--edit_strength", type=float, default=0.5)
+    p.add_argument("--cfg_scale", type=float, default=None,
+                   help="Override cfg.cfg_scale (default: the config value). "
+                        "The config default is tuned for training-time "
+                        "sampling; diagnostics run at 5.0+, so leaving this "
+                        "unset evaluates at far weaker guidance than the "
+                        "conditioning probes use.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -389,6 +452,9 @@ def main():
 
     cfg = DiffusionConfig()
     cfg.edit_strength = args.edit_strength
+    if args.cfg_scale is not None:
+        cfg.cfg_scale = args.cfg_scale
+    print(f"[EVAL] cfg_scale={cfg.cfg_scale}  edit_strength={cfg.edit_strength}")
 
     va = load_annotations(args.annotations_dir, cfg.clip_start_seconds,
                           cfg.clip_seconds)
@@ -422,7 +488,8 @@ def main():
     models = load_models(cfg, args.ckpt_dir, sample, _bigvgan, clap=clap)
 
     rows = evaluate_edits(cfg, clap, probe, edit_files, va, sr, models,
-                          os.path.join(args.ckpt_dir, "eval_edits.csv"))
+                          os.path.join(args.ckpt_dir, "eval_edits.csv"),
+                          seed=args.seed)
     summarize(rows, clap_acc, probe,
               os.path.join(args.ckpt_dir, "eval_summary.txt"))
 
