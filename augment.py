@@ -87,8 +87,27 @@ def augment_waveform(wav: np.ndarray, sr: int, rng: np.random.Generator,
 
 
 def plan_augmentation(counts: dict, moods_to_aug, target=None,
-                      cap=None) -> tuple:
+                      cap=None, ratio=None) -> tuple:
     """Decide how many augmented variants each clip of a mood needs.
+
+    Two modes:
+
+    target mode (ratio=None)
+        Boost each listed mood UP TO `target` clips. Use this only when the
+        trainer samples uniformly. It necessarily augments a rare mood harder
+        than a common one, so the augmentation artifacts (pitch-shift ringing,
+        added noise) end up correlated with the rare mood's label — a
+        shortcut feature the model can learn instead of the actual mood.
+        Measured on this corpus, the artifacts alone move CLAP +0.069 toward
+        the sad caption and the valence probe -0.061.
+
+    ratio mode (ratio=r)
+        Give EVERY listed mood the same r variants per real clip, so the
+        fraction of augmented clips is identical across moods and the
+        artifacts carry no mood information. Class balance is left to the
+        trainer's weighted sampler (train.train_diffusion already draws each
+        batch with inverse-frequency weights), which is the right division of
+        labour: the sampler equalizes counts, augmentation only adds variety.
 
     Returns a *fractional* variants-per-clip figure. Because a clip can
     only get a whole number of variants, the caller applies stochastic
@@ -105,7 +124,16 @@ def plan_augmentation(counts: dict, moods_to_aug, target=None,
 
     Returns:
         (plan, target) where plan = {mood: mean_variants_per_existing_clip}.
+        In ratio mode the second element is None — there is no single target
+        count, since each mood keeps its own size.
     """
+    if ratio is not None:
+        r = float(ratio)
+        if cap is not None:
+            r = min(r, float(cap))
+        r = max(0.0, r)
+        return {mood: r for mood in moods_to_aug}, None
+
     if target is None:
         target = max(counts.values()) if counts else 0
     plan = {}

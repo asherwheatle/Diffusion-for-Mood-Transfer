@@ -19,9 +19,25 @@ class DiffusionConfig:
     # "sad and melancholic" is boosted to parity by pitch-shifting /
     # time-shifting / adding noise to the real sad clips. Empty tuple
     # disables augmentation.
+    # NOTE both moods are listed on purpose. Augmenting only the minority mood
+    # made the augmentation artifacts a proxy for that mood: they appeared in
+    # 59% of sad clips and 0% of happy ones, and measured on real clips the
+    # artifacts alone move CLAP +0.069 toward the sad caption and the valence
+    # probe -0.061. The model could read "has pitch-shift ringing and added
+    # noise" as "sad" instead of learning mood, and because
+    # clap_cond_source="audio" the contamination reached the conditioning
+    # vectors themselves. Class balance does NOT need augmentation:
+    # train.train_diffusion already draws every batch with inverse-frequency
+    # weights, so each mood is ~50% of a batch whatever the raw counts.
     augment_moods = (
+        "happy and uplifting",
         "sad and melancholic",
     )
+    # Equal variants-per-clip for every augmented mood, so the augmented
+    # FRACTION is identical across moods and artifacts carry no mood
+    # information. Set to None to fall back to augment_target (count-matching)
+    # mode, which cannot equalize the fraction when the moods differ in size.
+    augment_ratio = 1.0
     augment_target = None        # target clips/mood; None = match largest mood
     max_aug_per_clip = 12        # ceiling on variants per real clip
     aug_max_semitones = 2.0      # pitch shift range (+/-)

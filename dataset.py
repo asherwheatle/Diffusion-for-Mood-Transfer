@@ -91,7 +91,8 @@ def build_dataset(audio_dir: str, n_songs, bigvgan_model,
                   clip_start_seconds: float = 15, melody_extractor=None,
                   cache_dir: str = None, clips_per_song: int = 1,
                   shuffle_seed: int = 0, augment_moods=(),
-                  augment_target=None, max_aug_per_clip: int = 12,
+                  augment_target=None, augment_ratio=None,
+                  max_aug_per_clip: int = 12,
                   aug_max_semitones: float = 2.0, aug_max_shift_frac: float = 0.2,
                   aug_snr_db_range=(20.0, 35.0), augment_seed: int = 0,
                   clap_embedder=None, clap_batch: int = 64):
@@ -156,7 +157,10 @@ def build_dataset(audio_dir: str, n_songs, bigvgan_model,
     augment_moods = tuple(augment_moods) if va is not None else ()
     aug_tag = ""
     if augment_moods:
-        t = "max" if augment_target is None else str(augment_target)
+        if augment_ratio is not None:
+            t = f"r{augment_ratio:g}"
+        else:
+            t = "max" if augment_target is None else str(augment_target)
         aug_tag = (f"_aug-{'+'.join(m.split()[0] for m in augment_moods)}"
                    f"-t{t}-c{max_aug_per_clip}-sd{augment_seed}")
 
@@ -216,9 +220,16 @@ def build_dataset(audio_dir: str, n_songs, bigvgan_model,
                         for p in files for k in range(clips_per_song))
             if m is not None)
         aug_plan, aug_target = plan_augmentation(
-            pre_counts, augment_moods, augment_target, max_aug_per_clip)
+            pre_counts, augment_moods, augment_target, max_aug_per_clip,
+            ratio=augment_ratio)
         aug_rng = np.random.default_rng(augment_seed)
-        print(f"[AUG] Balancing to ~{aug_target} clips/mood:")
+        if aug_target is None:
+            print(f"[AUG] Equal-ratio mode: every augmented mood gets the same "
+                  f"~{augment_ratio:g} variants/clip, so artifacts carry no "
+                  f"mood information. Class balance is left to the trainer's "
+                  f"weighted sampler.")
+        else:
+            print(f"[AUG] Balancing to ~{aug_target} clips/mood:")
         for m in augment_moods:
             print(f"[AUG]   {m}: {pre_counts.get(m, 0)} real x "
                   f"~{aug_plan[m]:.2f} variants/clip")

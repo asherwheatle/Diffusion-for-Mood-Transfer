@@ -178,6 +178,7 @@ def main():
             clips_per_song=cfg.clips_per_song,
             augment_moods=cfg.augment_moods,
             augment_target=cfg.augment_target,
+            augment_ratio=getattr(cfg, "augment_ratio", None),
             max_aug_per_clip=cfg.max_aug_per_clip,
             aug_max_semitones=cfg.aug_max_semitones,
             aug_max_shift_frac=cfg.aug_max_shift_frac,
