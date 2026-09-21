@@ -10,18 +10,33 @@ to "reconstruct this exact clip" and leaving the text nothing to move.
 This sweeps melody_scale -- the multiplier on the melody embedding -- holding
 song and sampling noise fixed, and reports:
 
-  clap_gain    does the edit move toward the correct mood? (signed)
+  cond_margin  THE METRIC TO JUDGE ON. cos(edit_m, m) minus the mean over this
+               song's other mood-edits. Every edit pays the same ~0.13
+               autoencoder+vocoder resynthesis cost, so absolute clap_gain is
+               negative whether or not conditioning works; comparing a song's
+               edits against each other cancels it.
+  clap_gain    absolute, CONFOUNDED by that cost. Reported for continuity only.
   transfer%    does the target mood rank #1 of the moods on the edited audio?
   chroma       melody preservation (expected to FALL as melody_scale drops)
   clap_spread  how far apart the mood-edits of one song are
 
 Interpretation:
-  gain rises as melody_scale falls ... melody control WAS capping the edit;
+  margin rises as melody_scale falls . melody control WAS capping the edit;
                                        find the knee and retrain with a
                                        weaker ControlNet contribution.
-  gain flat while chroma collapses ... melody is NOT the bottleneck. The
-                                       text->audio mapping is what is broken;
-                                       fixing it needs a retrain, not a knob.
+  margin flat, chroma DOES fall ...... melody is NOT the bottleneck; the
+                                       text->audio mapping is the suspect.
+  margin flat, chroma also flat ...... the knob tested nothing. A ControlNet
+                                       whose removal leaves chroma unchanged
+                                       is inert, and whatever preserves the
+                                       tune is elsewhere -- almost certainly
+                                       SDEdit's edit_strength, which starts
+                                       denoising partway down the chain and
+                                       keeps most of the source latent.
+                                       Sweep edit_strength instead.
+
+CHECK CHROMA RESPONDED BEFORE CONCLUDING ANYTHING ABOUT MELODY: the third case
+looks like the second one if you only read the gain column.
 
 It also prints the norm ratio ||melody_emb|| / ||input_proj(z)||, the direct
 measure of how loud melody is relative to the latent it is added to.
@@ -139,8 +154,10 @@ def main():
     rows = []
     for scale in MELODY_SCALES:
         gains, transfers, spreads, chromas = [], [], [], []
+        song_margins = []          # one mean cond_margin per song
         for s in songs:
             edit_embs, orig_cos = [], clap.cos_to_moods(s["orig_emb"])
+            cos_by_target = {}
             for mood in MOODS:
                 # SAME noise for every mood of this song => only text differs
                 torch.manual_seed(s["seed"])
@@ -156,17 +173,31 @@ def main():
                 transfers.append(int(MOODS[int(np.argmax(edit_cos))] == mood))
                 chromas.append(chroma_similarity(s["wav"], wav_e, sr))
                 edit_embs.append(emb)
+                cos_by_target[mood] = edit_cos
+            # cond_margin: cancels the resynthesis cost, which is shared by
+            # this song's edits and is far larger than the mood effect.
+            # Absolute gain cannot separate the two; this can.
+            song_margins.append(float(np.mean([
+                cos_by_target[m][MOODS.index(m)]
+                - np.mean([cos_by_target[m2][MOODS.index(m)] for m2 in MOODS])
+                for m in MOODS])))
             spreads.append(clap_spread(edit_embs))
 
+        n = len(song_margins)
+        margin_se = (float(np.std(song_margins, ddof=1) / np.sqrt(n))
+                     if n >= 2 else float("inf"))
         row = {
             "melody_scale": scale,
+            "cond_margin": round(float(np.mean(song_margins)), 4),
+            "cond_margin_se": round(margin_se, 4),
             "mean_clap_gain": round(float(np.mean(gains)), 4),
             "transfer_pct": round(100 * float(np.mean(transfers)), 1),
             "clap_spread": round(float(np.mean(spreads)), 4),
             "mean_chroma": round(float(np.mean(chromas)), 4),
         }
         rows.append(row)
-        print(f"  melody_scale={scale:<5} | gain={row['mean_clap_gain']:+.4f} "
+        print(f"  melody_scale={scale:<5} | margin={row['cond_margin']:+.4f}"
+              f" +/-{2*margin_se:.4f} | gain={row['mean_clap_gain']:+.4f} "
               f"transfer={row['transfer_pct']:>5.1f}% "
               f"| clap_spread={row['clap_spread']:.4f} "
               f"| chroma={row['mean_chroma']:.3f}")
@@ -177,26 +208,51 @@ def main():
         w.writeheader(); w.writerows(rows)
 
     # ---- Verdict ----
+    # Judged on cond_margin, never on absolute gain: gain includes the
+    # resynthesis cost, which is ~0.13 and swamps any mood effect, so a
+    # gain-based verdict says "broken" no matter what the conditioning did.
     full = next(r for r in rows if r["melody_scale"] == 1.0)
-    best = max(rows, key=lambda r: r["mean_clap_gain"])
-    lift = best["mean_clap_gain"] - full["mean_clap_gain"]
+    off = min(rows, key=lambda r: r["melody_scale"])
+    best = max(rows, key=lambda r: r["cond_margin"])
+    lift = best["cond_margin"] - full["cond_margin"]
+    chroma_response = full["mean_chroma"] - off["mean_chroma"]
+
     print(f"\n{'='*64}\n VERDICT\n{'='*64}")
-    print(f" Best gain {best['mean_clap_gain']:+.4f} at melody_scale="
-          f"{best['melody_scale']} vs {full['mean_clap_gain']:+.4f} at 1.0 "
+    print(f" Best margin {best['cond_margin']:+.4f} at melody_scale="
+          f"{best['melody_scale']} vs {full['cond_margin']:+.4f} at 1.0 "
           f"(lift {lift:+.4f}).")
-    if lift > 0.02 and best["melody_scale"] < 1.0:
-        print(f" => Melody control WAS capping the edit. chroma falls "
+    print(f" Chroma response to the knob: {off['mean_chroma']:.3f} at "
+          f"scale={off['melody_scale']} -> {full['mean_chroma']:.3f} at 1.0 "
+          f"(delta {chroma_response:+.3f}).")
+
+    # Precondition: the sweep only tests "is melody control the bottleneck" if
+    # the knob actually controls melody preservation. If chroma is flat, the
+    # ControlNet is inert and nothing about melody can be concluded either way.
+    if abs(chroma_response) < 0.05:
+        print("\n => INCONCLUSIVE ABOUT MELODY — and that is itself the finding.\n"
+              "    Removing the melody embedding entirely barely moved chroma,\n"
+              "    so the ControlNet is NOT what preserves the tune and this\n"
+              "    knob never tested the hypothesis. What pins the output to the\n"
+              f"    input is SDEdit: at edit_strength={cfg.edit_strength} denoising"
+              f" starts at\n"
+              f"    t={int(cfg.edit_strength * cfg.num_train_timesteps)}/"
+              f"{cfg.num_train_timesteps}, which retains most of the source latent.\n"
+              "    Sweep edit_strength, not melody_scale, to find the real cap.")
+    elif lift > 0.01 and best["melody_scale"] < 1.0:
+        print(f"\n => Melody control WAS capping the edit. chroma falls "
               f"{full['mean_chroma']:.3f} -> {best['mean_chroma']:.3f}; if that\n"
               f"    trade is acceptable, set cfg.melody_scale="
               f"{best['melody_scale']}, and consider retraining with a\n"
               f"    smaller ControlNet contribution.")
-    elif best["mean_clap_gain"] <= 0:
-        print(" => Melody is NOT the bottleneck: gain stays negative even with\n"
-              "    melody removed entirely. The text->audio mapping itself is\n"
-              "    wrong. Fix the text conditioning in training; no inference\n"
-              "    knob will recover this.")
+    elif best["cond_margin"] <= 2 * best["cond_margin_se"]:
+        print("\n => Melody is NOT the bottleneck: the margin stays within noise\n"
+              "    of zero even with melody removed, while chroma does respond.\n"
+              "    The text->audio mapping is the suspect. Confirm against\n"
+              "    probe_conditioning.py's audio arm before retraining: if the\n"
+              "    audio arm also reads ~0, the fault is downstream of the text\n"
+              "    encoder and reworking it will not help.")
     else:
-        print(" => Weakening melody helps only marginally. Look elsewhere.")
+        print("\n => Weakening melody helps only marginally. Look elsewhere.")
     print(f" Wrote {out_csv}")
     print("=" * 64)
 

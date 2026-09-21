@@ -5,7 +5,21 @@ Two independent judges, neither of which the model was trained against:
   1. CLAP (LAION music checkpoint) — an external audio<->text model. Measures
      whether an edit actually moved the audio toward the target mood text.
      Reported as:
-       * clap_gain   = cos(edited, target) - cos(original, target)  (did it move?)
+       * clap_margin = cos(edit_m, m) - mean over targets m' of cos(edit_m', m)
+                       THE PRIMARY METRIC. Every edit pays the same
+                       autoencoder+vocoder resynthesis cost, which lowers CLAP
+                       cosine to *any* caption; comparing a song's edits
+                       against each other cancels it, leaving only what the
+                       conditioning text changed.
+       * clap_gain_recon = cos(edited, target) - cos(reconstructed, target),
+                       where "reconstructed" is the same clip round-tripped
+                       through the codec with no diffusion. Same correction,
+                       measured directly rather than by cancellation.
+       * clap_gain   = cos(edited, target) - cos(original, target). CONFOUNDED:
+                       it sums the mood effect and the resynthesis cost, and
+                       the cost is the larger term, so this is negative almost
+                       regardless of how well conditioning works. Kept only so
+                       older runs stay comparable — do not draw verdicts from it.
        * transfer    = does the target mood rank #1 among all mood prompts?
 
   2. Chroma similarity — cosine between the original and edited chroma (pitch-class)
@@ -25,7 +39,7 @@ Usage (on a GPU node, inside the venv):
       --audio_dir /orange/ufdatastudios/asherwheatle/DEAM_audio/MEMD_audio \
       --annotations_dir /orange/ufdatastudios/asherwheatle/DEAM_audio/DEAM_Annotations \
       --clap_ckpt music_audioset_epoch_15_esc_90.14.pt \
-      --n_songs 20 --n_val 100 --edit_strength 0.5
+      --n_songs 20 --n_val 100 --edit_strength 0.6 --cfg_scale 5.0
 
 Outputs (written to --ckpt_dir):
   eval_edits.csv        one row per (song, target_mood): CLAP gain, transfer, chroma
@@ -373,44 +387,114 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
     return rows
 
 
+def _per_song_effect(rows, key, signed=False):
+    """Mean of `key` per song, then across songs -> (mean, standard error, n).
+
+    Songs are the independent unit: a song's mood edits share its audio and
+    its sampling noise, so treating each edit as independent would overstate
+    confidence. `signed` multiplies by valence_target_sign first, turning a
+    raw shift into a shift *toward the intended direction*.
+    """
+    songs = sorted({r["song"] for r in rows})
+    per_song = []
+    for s in songs:
+        vals = [r[key] * (r["valence_target_sign"] if signed else 1)
+                for r in rows if r["song"] == s]
+        if vals:
+            per_song.append(float(np.mean(vals)))
+    n = len(per_song)
+    if n == 0:
+        return float("nan"), float("inf"), 0
+    se = float(np.std(per_song, ddof=1) / np.sqrt(n)) if n >= 2 else float("inf")
+    return float(np.mean(per_song)), se, n
+
+
 def summarize(rows, clap_acc, probe, out_txt):
     pm = probe.metrics
-    lines = ["=" * 60, " EVALUATION SUMMARY", "=" * 60,
+    chance = 1 / len(MOODS)
+    lines = ["=" * 72, " EVALUATION SUMMARY", "=" * 72,
+             f" cfg_scale {rows[0]['cfg_scale']}   "
+             f"edit_strength {rows[0]['edit_strength']}",
              f" CLAP validation top-1 accuracy : {clap_acc:.3f} "
-             f"(chance {1/len(MOODS):.3f})",
+             f"(chance {chance:.3f})",
              f" Valence probe held-out R^2     : {pm.get('heldout_r2', float('nan')):.3f} "
              f"(pearson {pm.get('heldout_pearson', float('nan')):.3f}, "
              f"n={int(pm.get('n_total', 0))})", ""]
-    lines.append(f" {'target mood':24s} {'mean gain':>10s} "
-                 f"{'transfer%':>10s} {'chroma':>8s} {'val.shift':>10s} "
-                 f"{'val.dir%':>9s}")
+
+    # ---- The codec floor, measured rather than assumed ----
+    codec_clap = np.mean([r["clap_cos_recon"] - r["clap_cos_original"]
+                          for r in rows])
+    codec_val = np.mean([r["valence_recon"] - r["valence_original"]
+                         for r in rows])
+    lines += [" RESYNTHESIS FLOOR (autoencoder + vocoder, no diffusion)",
+              f"   CLAP cosine cost   : {codec_clap:+.4f}  "
+              f"(paid by every edit, toward every caption)",
+              f"   valence probe cost : {codec_val:+.4f}",
+              f"   chroma ceiling     : "
+              f"{np.mean([r['chroma_recon'] for r in rows]):.3f}  "
+              f"(recon vs original: no edit can score above this)",
+              " Any metric measured against the RAW input inherits these.", ""]
+
+    # ---- Primary: margins (codec/song/noise all cancelled) ----
+    lines.append(" PRIMARY (conditioning-only: edit vs this song's other edits)")
+    lines.append(f" {'target mood':24s} {'clap.margin':>12s} "
+                 f"{'val.margin':>11s} {'val.dir%':>9s} {'transfer%':>10s} "
+                 f"{'chroma':>8s}")
     for m in MOODS:
         sub = [r for r in rows if r["target_mood"] == m]
         if not sub:
             continue
-        gain = np.mean([r["clap_gain"] for r in sub])
-        tr = 100 * np.mean([r["transfer_success"] for r in sub])
-        ch = np.mean([r["chroma_sim"] for r in sub])
-        # signed shift toward the mood's intended valence direction
-        vshift = np.mean([r["valence_shift"] * r["valence_target_sign"]
-                          for r in sub])
-        vdir = 100 * np.mean([r["valence_correct_dir"] for r in sub])
-        lines.append(f" {m:24s} {gain:>10.4f} {tr:>9.1f}% {ch:>8.3f} "
-                     f"{vshift:>10.4f} {vdir:>8.1f}%")
-    overall_vshift = np.mean([r["valence_shift"] * r["valence_target_sign"]
-                              for r in rows])
+        lines.append(
+            f" {m:24s} {np.mean([r['clap_margin'] for r in sub]):>+12.4f} "
+            f"{np.mean([r['valence_margin'] * r['valence_target_sign'] for r in sub]):>+11.4f} "
+            f"{100*np.mean([r['valence_correct_dir_margin'] for r in sub]):>8.1f}% "
+            f"{100*np.mean([r['transfer_success'] for r in sub]):>9.1f}% "
+            f"{np.mean([r['chroma_sim'] for r in sub]):>8.3f}")
+
+    cm, cm_se, n_songs = _per_song_effect(rows, "clap_margin")
+    vm, vm_se, _ = _per_song_effect(rows, "valence_margin", signed=True)
+    gr, gr_se, _ = _per_song_effect(rows, "clap_gain_recon")
+    tr = 100 * np.mean([r["transfer_success"] for r in rows])
+
+    def verdict(mean, se):
+        if not np.isfinite(se):
+            return "too few songs to say"
+        if mean > 2 * se:
+            return "POSITIVE (> 2 SE)"
+        if mean < -2 * se:
+            return "NEGATIVE (> 2 SE)"
+        return "not distinguishable from zero"
+
     lines += ["",
-              f" Overall mean CLAP gain     : {np.mean([r['clap_gain'] for r in rows]):.4f}",
-              f" Overall transfer success   : {100*np.mean([r['transfer_success'] for r in rows]):.1f}%",
+              f" Overall CLAP margin        : {cm:+.4f} +/- {2*cm_se:.4f} (2 SE, "
+              f"n={n_songs} songs)  {verdict(cm, cm_se)}",
+              f" Overall valence margin(dir): {vm:+.4f} +/- {2*vm_se:.4f} (2 SE)"
+              f"  {verdict(vm, vm_se)}",
+              f" Overall gain vs recon      : {gr:+.4f} +/- {2*gr_se:.4f} (2 SE)"
+              f"  {verdict(gr, gr_se)}",
+              f" Overall transfer success   : {tr:.1f}%  (chance {100*chance:.1f}%)",
               f" Overall chroma preserved   : {np.mean([r['chroma_sim'] for r in rows]):.3f}",
-              f" Overall valence shift(dir) : {overall_vshift:.4f}",
-              f" Overall valence dir correct: {100*np.mean([r['valence_correct_dir'] for r in rows]):.1f}%",
+              ""]
+
+    # ---- Confounded, kept only so old runs stay comparable ----
+    raw_gain = np.mean([r["clap_gain"] for r in rows])
+    raw_vshift = np.mean([r["valence_shift"] * r["valence_target_sign"]
+                          for r in rows])
+    raw_vbias = np.mean([r["valence_shift"] for r in rows])
+    lines += [" CONFOUNDED (vs raw input; includes the floor above —"
+              " for back-comparison only)",
+              f"   mean CLAP gain           : {raw_gain:+.4f}",
+              f"   valence shift(dir)       : {raw_vshift:+.4f}",
+              f"   valence shift(unsigned)  : {raw_vbias:+.4f}  <- the codec"
+              f" offset, not a model bias",
+              f"   valence dir correct      : "
+              f"{100*np.mean([r['valence_correct_dir'] for r in rows]):.1f}%",
               "",
-              " Read: gain>0 and transfer high => mood moved toward the text.",
-              " chroma near 1 => melody kept. You want BOTH high at once.",
-              " val.shift(dir)>0 & val.dir% high => valence moved the intended way;",
-              " trust these only if the probe's held-out R^2 above is well over 0.",
-              "=" * 60]
+              " Read: clap.margin / val.margin > 0 => the TEXT moved the audio",
+              " toward its target. These cancel the resynthesis floor, so unlike",
+              " raw gain they can legitimately be positive. chroma near 1 => melody",
+              " kept. Trust valence only if the probe's held-out R^2 is well over 0.",
+              "=" * 72]
     text = "\n".join(lines)
     print("\n" + text)
     with open(out_txt, "w") as f:
