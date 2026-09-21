@@ -275,10 +275,17 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
 
       *_original  vs the raw input clip. Confounded: the edit also paid the
                   autoencoder+vocoder resynthesis cost, which lowers CLAP
-                  cosine to every caption and drags the valence probe down,
-                  because both judges were fit on real audio.
+                  cosine to every caption because CLAP was fit on real audio.
+                  Measured at -0.118 on job_42463485, i.e. nearly all of the
+                  -0.133 "gain" that run reported.
       *_recon     vs the same clip round-tripped through the codec with no
                   diffusion (inference.reconstruct). Subtracts that cost.
+                  NOTE the codec's effect on the two judges is NOT the same
+                  sign: measured on job_42463485 it moved CLAP cosine -0.118
+                  but valence +0.088. So a common-mode valence shift cannot be
+                  written off as resynthesis — whatever the recon control does
+                  not explain belongs to the diffusion stage, which unlike the
+                  codec regenerates the latent instead of round-tripping it.
       *_margin    vs this song's *other* mood edits. Cancels everything the
                   edits share — codec, song, and noise — leaving only what the
                   conditioning text changed. This is the primary metric, and
@@ -481,12 +488,23 @@ def summarize(rows, clap_acc, probe, out_txt):
     raw_vshift = np.mean([r["valence_shift"] * r["valence_target_sign"]
                           for r in rows])
     raw_vbias = np.mean([r["valence_shift"] for r in rows])
+    # Split the prompt-independent (common-mode) valence shift into the part
+    # the codec explains and the part left over. The leftover is the diffusion
+    # stage: SDEdit regenerates the latent rather than round-tripping it, so
+    # unlike the codec term this one IS a property of the model. Do not
+    # attribute the whole common-mode shift to resynthesis without checking
+    # this split — on job_42463485 the codec term came out POSITIVE.
+    codec_part = codec_val
+    diffusion_part = raw_vbias - codec_val
     lines += [" CONFOUNDED (vs raw input; includes the floor above —"
               " for back-comparison only)",
               f"   mean CLAP gain           : {raw_gain:+.4f}",
               f"   valence shift(dir)       : {raw_vshift:+.4f}",
-              f"   valence shift(unsigned)  : {raw_vbias:+.4f}  <- the codec"
-              f" offset, not a model bias",
+              f"   valence shift(unsigned)  : {raw_vbias:+.4f}  <- common-mode,"
+              f" prompt-independent",
+              f"     of which codec         : {codec_part:+.4f}",
+              f"     of which diffusion     : {diffusion_part:+.4f}  <- a real"
+              f" property of the model",
               f"   valence dir correct      : "
               f"{100*np.mean([r['valence_correct_dir'] for r in rows]):.1f}%",
               "",
