@@ -140,7 +140,18 @@ class DiffusionConfig:
     batch_size = 64
     num_workers = 4           # DataLoader workers for the autoencoder loop
     diff_lr = 1e-4
-    diff_epochs = 10000
+    # Steps, not passes over the data: the loop draws one batch per iteration
+    # (train.py), so samples seen = diff_epochs * batch_size.
+    #
+    # Raised from 10000 to match EPOCHS, not steps, across the augmentation
+    # change. Equal-ratio augmentation grew the dataset 11,064 -> 15,654 clips,
+    # so the old 10,000 steps went from 57.9 passes over the data to 40.9 — the
+    # Sep 21 model was trained ~30% less than the Sep 17 one it was compared
+    # against, and its loss was correspondingly higher and noisier at the end
+    # (last-6 mean 0.183 vs 0.153). Holding passes fixed at 57.9 needs
+    # 57.9 * 15654 / 64 = 14149 steps, so a step-count comparison is not a
+    # like-for-like one.
+    diff_epochs = 14149
     cfg_scale = 1.5
     # Fraction of training steps that see the null text embedding. 0.1 is the
     # low end of the usual range and leaves the unconditional path thinly

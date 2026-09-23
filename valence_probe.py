@@ -161,29 +161,47 @@ def fit_valence_probe(embeddings: np.ndarray, valence: np.ndarray,
 def train_probe_from_clip_files(clap, files, va, sr, start_s, dur_s,
                                 load_clip, song_id_from_filename,
                                 cache_path: str = None,
-                                val_frac: float = 0.2, seed: int = 0
+                                val_frac: float = 0.2, seed: int = 0,
+                                recon_fn=None, domain: str = "raw"
                                 ) -> ValenceProbe:
     """Embed each annotated clip with CLAP and fit the valence probe.
 
     `clap`, `load_clip`, `song_id_from_filename` are passed in from evaluate.py
     so this module stays free of the heavy CLAP/audio imports. Caches the fitted
     probe (small) to `cache_path` and reuses it on later runs.
+
+    `recon_fn`, if given, is applied to each clip's waveform before embedding
+    (see inference.reconstruct). This is the calibration fix: a probe fit on
+    RAW audio is asked at eval time to score vocoded, diffusion-generated
+    audio, which is off-manifold for CLAP, so its predictions there are
+    extrapolations. Passing the codec round-trip fits the head on the same
+    kind of audio the edits are made of. The valence LABEL still comes from
+    the source song, which is legitimate because the codec round-trip is not
+    supposed to change the mood -- only the audio's manifold.
+
+    `domain` is a label for printing only ("raw" or "recon"); it is kept out
+    of `metrics` because ValenceProbe.load coerces every metric to float.
     """
     if cache_path and os.path.exists(cache_path):
         probe = ValenceProbe.load(cache_path)
         m = probe.metrics
-        print(f"[VPROBE] Loaded cached probe: {cache_path}")
+        print(f"[VPROBE] Loaded cached probe [{domain}]: {cache_path}")
         print(f"[VPROBE] held-out R^2={m.get('heldout_r2', float('nan')):.3f} "
               f"pearson={m.get('heldout_pearson', float('nan')):.3f} "
               f"(n={int(m.get('n_total', 0))}, lambda={m.get('lambda')})")
         return probe
 
-    print(f"\n{'='*60}\n VALENCE PROBE: embedding {len(files)} annotated clips"
-          f"\n{'='*60}")
+    print(f"\n{'='*60}\n VALENCE PROBE [{domain}]: embedding {len(files)} "
+          f"annotated clips\n{'='*60}")
+    if recon_fn is not None:
+        print("[VPROBE] Fitting on CODEC-RECONSTRUCTED audio, so the head is "
+              "calibrated\n         on the manifold the edits actually live on.")
     embs, vals = [], []
     for path in files:
         sid = song_id_from_filename(path)
         wav = load_clip(path, sr, start_s, dur_s)
+        if recon_fn is not None:
+            wav = recon_fn(wav)
         embs.append(clap.audio_embed(wav, sr))
         vals.append(va[sid][0])            # (valence, arousal) -> valence
     embs = np.stack(embs, axis=0)
@@ -191,7 +209,7 @@ def train_probe_from_clip_files(clap, files, va, sr, start_s, dur_s,
 
     probe = fit_valence_probe(embs, vals, val_frac=val_frac, seed=seed)
     m = probe.metrics
-    print(f"[VPROBE] held-out R^2={m['heldout_r2']:.3f} "
+    print(f"[VPROBE] [{domain}] held-out R^2={m['heldout_r2']:.3f} "
           f"pearson={m['heldout_pearson']:.3f}  "
           f"(train={int(m['n_train'])}, held-out={int(m['n_heldout'])}, "
           f"lambda={m['lambda']:g})")
