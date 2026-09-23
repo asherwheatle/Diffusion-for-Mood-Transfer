@@ -132,6 +132,21 @@ class DiffusionConfig:
     # Diffusion
     num_train_timesteps = 1000
     prediction_type = "v"
+    # How the pre-encoded latents are standardized before diffusion (see
+    # train.train_diffusion).
+    #   "per_channel" — one mean/std per latent channel, shape (1, C, 1, 1)
+    #   "global"      — legacy: a single scalar mean/std over everything
+    # The encoder's per-channel std spans 21x, so the legacy global scalar left
+    # channels at std 0.095-1.995 against unit-variance diffusion noise. Every
+    # edit strength was then a blend: at t=600, 28/32 channels were already pure
+    # noise (input content gone) while 4/32 stayed pinned to the input; at t=350
+    # it was 21/11. edit_strength therefore could not trade melody preservation
+    # against mood change — it did both at once, to different channels. Going
+    # per-channel makes all 32 cross together, so the knob means one thing, but
+    # the transition is sharper: sweep between 0.35 and 0.6 rather than assuming
+    # the old 0.6 still behaves the same.
+    # Keep "global" only to reproduce a pre-Sep-2026 run.
+    latent_norm = "per_channel"
 
     # Training
     n_train_songs = None      # None = entire annotated dataset (~1800 songs)
