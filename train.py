@@ -202,11 +202,63 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
     del mel_padded   # free the padded mel copy; only latents are needed now
     # Standardize latents so the diffusion's unit-variance noise assumption
     # holds (the encoder's GroupNorm+SiLU output is skewed, std != 1).
-    latent_mean = z0_all.mean()
-    latent_std = z0_all.std()
+    #
+    # PER-CHANNEL, not one global scalar. Measured on the job_42891316 AE the
+    # raw per-channel std spans 0.031-0.644 (21x). Dividing all 32 channels by
+    # a single sigma left them at std 0.095-1.995, and diffusion then adds
+    # unit-variance noise to every one of them. Counting channels whose SNR at
+    # the SDEdit start is below 1 (input content already destroyed, regenerated
+    # from the prior) against those above it (pinned to the input):
+    #
+    #                    t=350 (strength .35)   t=600 (strength .6)
+    #     global          21 gone / 11 kept      28 gone /  4 kept
+    #     per_channel      0 gone / 32 kept      32 gone /  0 kept
+    #
+    # So under one global sigma, EVERY edit strength was a blend of regenerate
+    # and preserve, and turning the knob only shifted the mix 21:11 -> 28:4.
+    # That is why melody preservation and mood transfer were both mediocre at
+    # the same time instead of trading against each other: different channels
+    # sat at opposite ends of the trade no matter what strength was asked for.
+    # Per-channel makes the latent act as one unit, so edit_strength finally
+    # means one thing — at the cost of a sharper transition, since all 32
+    # channels now cross together somewhere between 0.35 and 0.6.
+    #
+    # Four channels landed at std 0.10, crossing SNR=1 at t=55 (6% of the
+    # schedule) — noise to the DiT almost always. Per-channel also removes a DC
+    # offset of up to 1.279 in units of the noise (post-norm per-channel mean
+    # goes to exactly 0), which the DiT otherwise spends capacity representing.
+    #
+    # Measured effect on the latent's shape: skew 2.55 -> 1.20, excess kurtosis
+    # 13.6 -> 3.5. The remainder is the encoder's final GroupNorm+SiLU (a hard
+    # floor at -0.2785 with 3.4% of mass pinned to it); only an autoencoder
+    # change removes that, and it needs an AE retrain.
+    #
+    # Old checkpoints hold scalar latent_mean/latent_std. Nothing breaks: every
+    # consumer only broadcasts them, so a (1,C,1,1) stat and a scalar are
+    # interchangeable at load time.
+    norm_mode = getattr(cfg, "latent_norm", "per_channel")
+    if norm_mode == "per_channel":
+        latent_mean = z0_all.mean(dim=(0, 2, 3), keepdim=True)   # (1, C, 1, 1)
+        latent_std = z0_all.std(dim=(0, 2, 3), keepdim=True)
+    elif norm_mode == "global":
+        latent_mean = z0_all.mean()
+        latent_std = z0_all.std()
+    else:
+        raise ValueError(f"unknown cfg.latent_norm {norm_mode!r} "
+                         f"(expected 'per_channel' or 'global')")
+    # A near-dead channel must never become a division by ~0.
+    latent_std = latent_std.clamp_min(1e-6)
     z0_all = (z0_all - latent_mean) / latent_std
-    print(f"[DIFF] Latents: {tuple(z0_all.shape)} "
-          f"(mean={latent_mean.item():.4f}, std={latent_std.item():.4f})")
+    # Report the spread, not just a single number: the whole point of the change
+    # is that one number was hiding a 21x range. Post-norm std should be ~1 for
+    # every channel — if it is not, the stats and the data disagree.
+    post = z0_all.std(dim=(0, 2, 3))
+    print(f"[DIFF] Latents: {tuple(z0_all.shape)}  latent_norm={norm_mode}")
+    print(f"[DIFF]   pre-norm  mean [{latent_mean.min():+.4f}, {latent_mean.max():+.4f}]  "
+          f"std [{latent_std.min():.4f}, {latent_std.max():.4f}] "
+          f"({latent_std.max() / latent_std.min():.1f}x spread)")
+    print(f"[DIFF]   post-norm per-channel std [{post.min():.4f}, {post.max():.4f}] "
+          f"(want ~1.00 for all {post.numel()})")
     print(f"[DIFF] Melody shape: {tuple(melody_all.shape)}")
 
     _, C_lat, H_lat, W_lat = z0_all.shape

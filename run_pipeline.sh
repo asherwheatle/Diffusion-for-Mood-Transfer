@@ -110,8 +110,18 @@ mkdir -p logs output
 #        sbatch run_pipeline.sh output/job_40998207
 #    Training then picks up from that dir's *_ckpt.pt — a completed autoencoder
 #    (epoch == ae_epochs) is skipped and the run goes straight to diffusion.
+#
+#    Steps: an optional SECOND argument overrides cfg.diff_epochs (which is a
+#    step count, not passes over the data). Combined with a resume dir this
+#    EXTENDS an existing run rather than repeating it, since the diffusion
+#    resume restores the optimizer state along with the weights:
+#        sbatch run_pipeline.sh output/job_XXXXXX 14149
+#    picks a 10,000-step checkpoint back up and trains steps 10001-14149.
+#    Copy the dir first if you still need the shorter model — resuming
+#    overwrites diffusion.pt and the eval outputs in place.
 # ---------------------------------------------------------------------------
 RESUME_DIR="${1:-}"            # ${1:-} keeps this safe under `set -u`
+DIFF_STEPS="${2:-}"            # empty -> use cfg.diff_epochs
 if [ -n "$RESUME_DIR" ]; then
     OUTPUT_DIR="$RESUME_DIR"
     echo "[RUN] Resuming into existing output dir: $OUTPUT_DIR"
@@ -119,6 +129,12 @@ else
     OUTPUT_DIR="output/job_${SLURM_JOB_ID}"
 fi
 mkdir -p "$OUTPUT_DIR"
+
+TRAIN_ARGS=()
+if [ -n "$DIFF_STEPS" ]; then
+    TRAIN_ARGS+=(--diff_epochs "$DIFF_STEPS")
+    echo "[RUN] Overriding diffusion steps: $DIFF_STEPS"
+fi
 
 echo "[RUN] Starting pipeline on $(date)"
 echo "[RUN] Job ID: $SLURM_JOB_ID  ->  output dir: $OUTPUT_DIR"
@@ -135,7 +151,8 @@ python mood_diffusion.py \
     --mode full \
     --audio_dir "$DATA_ROOT/MEMD_audio" \
     --annotations_dir "$DATA_ROOT/DEAM_Annotations" \
-    --output_dir "$OUTPUT_DIR"
+    --output_dir "$OUTPUT_DIR" \
+    "${TRAIN_ARGS[@]+"${TRAIN_ARGS[@]}"}"
 status=$?
 set -e
 

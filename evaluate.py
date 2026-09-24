@@ -340,7 +340,8 @@ def measure_mood_gap(clap: Clap, files: list, va: dict, sr: int,
 # ---------------------------------------------------------------------------
 # Stage 2: edit N songs x every mood, score each edit
 # ---------------------------------------------------------------------------
-def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
+def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0,
+                   probe_recon=None):
     """Edit every song toward every mood and score each edit.
 
     Each edit is scored three ways, in increasing order of trustworthiness:
@@ -377,6 +378,12 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
                   "valence_target_sign", "valence_correct_dir",
                   "valence_correct_dir_margin",
                   "cfg_scale", "edit_strength"]
+    # Same three valence readings taken with the codec-domain probe. Stored
+    # alongside rather than replacing the raw-domain ones so old runs stay
+    # comparable and the two can be differenced directly from the CSV.
+    if probe_recon is not None:
+        fieldnames += ["rp_valence_original", "rp_valence_recon",
+                       "rp_valence_edited"]
     # Full cosine vector of each edit, one column per mood. Storing these
     # (not just the cosine toward the edit's own target) makes the mood-axis
     # separation directly computable from the CSV afterwards.
@@ -395,12 +402,16 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
         orig_emb = clap.audio_embed(wav_orig, sr)
         orig_cos = clap.cos_to_moods(orig_emb)  # (n_moods,)
         v_orig = probe.predict(orig_emb)
+        rp_orig = (probe_recon.predict(orig_emb)
+                   if probe_recon is not None else None)
 
         # Reconstruction control: the codec cost with no mood edit at all.
         wav_recon = reconstruct(waveform, ae, _bigvgan, cfg).squeeze(0).numpy()
         recon_emb = clap.audio_embed(wav_recon, sr)
         recon_cos = clap.cos_to_moods(recon_emb)
         v_recon = probe.predict(recon_emb)
+        rp_recon = (probe_recon.predict(recon_emb)
+                    if probe_recon is not None else None)
         chroma_recon = chroma_similarity(wav_orig, wav_recon, sr)
 
         song_seed = seed + si
@@ -419,6 +430,8 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
             pred = MOODS[int(np.argmax(edit_cos))]
 
             v_edit = probe.predict(edit_emb)
+            rp_edit = (probe_recon.predict(edit_emb)
+                       if probe_recon is not None else None)
             v_shift = v_edit - v_orig
             desired = MOOD_VALENCE_SIGN[target]
             cos_by_target[target] = edit_cos
@@ -447,6 +460,10 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0):
                 "edit_strength": cfg.edit_strength,
                 **{c: round(float(edit_cos[j]), 4)
                    for j, c in enumerate(cos_cols)},
+                **({"rp_valence_original": round(float(rp_orig), 4),
+                    "rp_valence_recon": round(float(rp_recon), 4),
+                    "rp_valence_edited": round(float(rp_edit), 4)}
+                   if probe_recon is not None else {}),
             })
 
         # Margins need every target's edit of this song, hence computed here.
@@ -536,7 +553,8 @@ def _transfer_split(rows):
     return f(cross), f(same)
 
 
-def summarize(rows, clap_acc, probe, out_txt, mood_gap=None):
+def summarize(rows, clap_acc, probe, out_txt, mood_gap=None,
+              probe_recon=None):
     pm = probe.metrics
     chance = 1 / len(MOODS)
     lines = ["=" * 72, " EVALUATION SUMMARY", "=" * 72,
@@ -657,8 +675,47 @@ def summarize(rows, clap_acc, probe, out_txt, mood_gap=None):
               f" property of the model",
               f"   valence dir correct      : "
               f"{100*np.mean([r['valence_correct_dir'] for r in rows]):.1f}%",
-              "",
-              " Read: clap.margin / val.margin > 0 => the TEXT moved the audio",
+              ""]
+
+    # ---- Is the valence drift real, or is the probe extrapolating? ----
+    # The raw-domain probe is fit on real recordings and then asked to score
+    # vocoded, diffusion-generated audio it has never seen. The recon-domain
+    # probe is fit on codec round-trips of the SAME clips with the SAME
+    # labels, so it is on-manifold for everything except the diffusion step.
+    # Re-running the codec/diffusion split under both says how much of the
+    # drift is a property of the model and how much is the measurement.
+    if probe_recon is not None and "rp_valence_edited" in rows[0]:
+        rpm = probe_recon.metrics
+        rp_codec = np.mean([r["rp_valence_recon"] - r["rp_valence_original"]
+                            for r in rows])
+        rp_bias = np.mean([r["rp_valence_edited"] - r["rp_valence_original"]
+                           for r in rows])
+        rp_diff = rp_bias - rp_codec
+        shrink = (100 * (1 - abs(rp_diff) / abs(diffusion_part))
+                  if diffusion_part else float("nan"))
+        lines += [" PROBE CALIBRATION CHECK (raw-domain vs codec-domain probe)",
+                  f"   {'':22s} {'raw':>10s} {'recon':>10s}",
+                  f"   held-out R^2         : "
+                  f"{pm.get('heldout_r2', float('nan')):>10.3f} "
+                  f"{rpm.get('heldout_r2', float('nan')):>10.3f}",
+                  f"   common-mode shift    : {raw_vbias:>+10.4f} {rp_bias:>+10.4f}",
+                  f"     of which codec     : {codec_part:>+10.4f} {rp_codec:>+10.4f}",
+                  f"     of which diffusion : {diffusion_part:>+10.4f} {rp_diff:>+10.4f}",
+                  f"   => recalibrating the probe removes {shrink:.0f}% of the"
+                  f" diffusion drift.",
+                  "   Near 100% => the drift was the probe extrapolating"
+                  " off-manifold, not",
+                  "   the model. Near 0% => the model really does push audio"
+                  " toward sad, and",
+                  "   retraining is the lever. Read this BEFORE trusting any"
+                  " valence number",
+                  "   above. If the recon probe's R^2 collapses, the valence"
+                  " readout cannot",
+                  "   survive vocoding at all and only CLAP margins are"
+                  " meaningful.",
+                  ""]
+
+    lines += [" Read: clap.margin / val.margin > 0 => the TEXT moved the audio",
               " toward its target. These cancel the resynthesis floor, so unlike",
               " raw gain they can legitimately be positive. chroma near 1 => melody",
               " kept. Trust valence only if the probe's held-out R^2 is well over 0.",
@@ -705,6 +762,13 @@ def main():
                         "unset evaluates at far weaker guidance than the "
                         "conditioning probes use.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--skip_recon_probe", action="store_true",
+                   help="Skip the codec-domain valence probe. That probe is "
+                        "the calibration control: it re-fits the valence head "
+                        "on codec-reconstructed audio so it is not "
+                        "extrapolating when it scores an edit. Skipping it "
+                        "leaves only the raw-domain probe, whose valence "
+                        "numbers on generated audio are off-manifold.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -732,26 +796,11 @@ def main():
                              cfg.clip_seconds,
                              os.path.join(args.ckpt_dir, "clap_validation.csv"))
 
-    # Stage 1b: fit the continuous valence probe on frozen CLAP embeddings
-    # (cheap — embedding only, no editing). Cached to the ckpt dir.
-    probe_files = pick_annotated_songs(args.audio_dir, va, args.n_probe,
-                                       require_label=False)
-    probe = train_probe_from_clip_files(
-        clap, probe_files, va, sr, cfg.clip_start_seconds, cfg.clip_seconds,
-        load_clip, song_id_from_filename,
-        cache_path=os.path.join(args.ckpt_dir, "valence_probe.npz"))
-
-    # Stage 1c: the yardstick — how far apart are REAL songs of each mood?
-    mood_gap = {}
-    if args.n_gap > 0 and len(MOODS) == 2:
-        gap_files = pick_annotated_songs(args.audio_dir, va, args.n_gap,
-                                         balanced=True)
-        mood_gap = measure_mood_gap(clap, gap_files, va, sr,
-                                    cfg.clip_start_seconds, cfg.clip_seconds)
-
-    # Stage 2: load the model and evaluate edits. Balanced by default so both
-    # edit directions get equal weight; DEAM's skew otherwise leaves the
-    # minority->majority direction resting on a handful of songs.
+    # Stage 1b: pick the edit songs and load the model FIRST. The recon-domain
+    # probe below needs the autoencoder, so the checkpoints have to be up
+    # before any probe is fitted. Balanced by default so both edit directions
+    # get equal weight; DEAM's skew otherwise leaves the minority->majority
+    # direction resting on a handful of songs.
     edit_files = pick_annotated_songs(args.audio_dir, va, args.n_songs,
                                       balanced=not args.unbalanced_songs)
     gt_counts = Counter(mood_from_va(*va[song_id_from_filename(f)])
@@ -760,13 +809,53 @@ def main():
     sample = load_clip(edit_files[0], sr, cfg.clip_start_seconds, cfg.clip_seconds)
     print("[STEP] Loading mood-diffusion checkpoints...")
     models = load_models(cfg, args.ckpt_dir, sample, _bigvgan, clap=clap)
+    ae = models[0]
 
+    # Stage 1c: fit the continuous valence probe on frozen CLAP embeddings
+    # (cheap — embedding only, no editing). Cached to the ckpt dir.
+    #
+    # TWO probes are fitted on the same clips and the same labels, differing
+    # only in the audio they see:
+    #   raw   — the historical probe, fit on the original recordings.
+    #   recon — fit on the codec round-trip, i.e. the manifold the edits are
+    #           actually made of.
+    # The raw probe has never seen vocoded audio, so every valence number it
+    # reports about an edit is an extrapolation. Comparing the two separates
+    # "the model shifts mood" from "the probe mis-scores generated audio".
+    probe_files = pick_annotated_songs(args.audio_dir, va, args.n_probe,
+                                       require_label=False)
+    probe = train_probe_from_clip_files(
+        clap, probe_files, va, sr, cfg.clip_start_seconds, cfg.clip_seconds,
+        load_clip, song_id_from_filename,
+        cache_path=os.path.join(args.ckpt_dir, "valence_probe.npz"))
+
+    probe_recon = None
+    if not args.skip_recon_probe:
+        def _recon_fn(wav):
+            wv = torch.FloatTensor(wav).unsqueeze(0)
+            return reconstruct(wv, ae, _bigvgan, cfg).squeeze(0).numpy()
+
+        probe_recon = train_probe_from_clip_files(
+            clap, probe_files, va, sr, cfg.clip_start_seconds, cfg.clip_seconds,
+            load_clip, song_id_from_filename,
+            cache_path=os.path.join(args.ckpt_dir, "valence_probe_recon.npz"),
+            recon_fn=_recon_fn, domain="recon")
+
+    # Stage 1d: the yardstick — how far apart are REAL songs of each mood?
+    mood_gap = {}
+    if args.n_gap > 0 and len(MOODS) == 2:
+        gap_files = pick_annotated_songs(args.audio_dir, va, args.n_gap,
+                                         balanced=True)
+        mood_gap = measure_mood_gap(clap, gap_files, va, sr,
+                                    cfg.clip_start_seconds, cfg.clip_seconds)
+
+    # Stage 2: evaluate edits.
     rows = evaluate_edits(cfg, clap, probe, edit_files, va, sr, models,
                           os.path.join(args.ckpt_dir, "eval_edits.csv"),
-                          seed=args.seed)
+                          seed=args.seed, probe_recon=probe_recon)
     summarize(rows, clap_acc, probe,
               os.path.join(args.ckpt_dir, "eval_summary.txt"),
-              mood_gap=mood_gap)
+              mood_gap=mood_gap, probe_recon=probe_recon)
 
 
 if __name__ == "__main__":
