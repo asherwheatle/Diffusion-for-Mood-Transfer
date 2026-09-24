@@ -2,8 +2,10 @@
 # =============================================================================
 # HiPerGator SLURM job — melody-lock x edit-strength sweep (does the lock block sad->happy?)
 # =============================================================================
-# Submit with:  sbatch run_sweep_lock.sh [checkpoint_dir]
+# Submit with:  sbatch run_sweep_lock.sh [checkpoint_dir] [extra sweep_lock.py args...]
 #   e.g.        sbatch run_sweep_lock.sh output/job_perchan
+#               sbatch run_sweep_lock.sh output/job_X --melody_scales 1.0 0.5 0.0
+#   (extra args come last, so they override the defaults below)
 # Monitor with: squeue -u $USER
 # Result:       $CKPT_DIR/sweep_lock.csv  (+ summary in the .out log)
 # =============================================================================
@@ -54,6 +56,7 @@ python sweep_lock.py \
     --audio_dir "$DATA_ROOT/MEMD_audio" \
     --annotations_dir "$DATA_ROOT/DEAM_Annotations" \
     --clap_ckpt "$CLAP_CKPT" \
-    --n_songs 30 --melody_scales 1.0 0.0 --edit_strengths 0.6 0.8 0.95 --cfg_scale 7.0
+    --n_songs 30 --melody_scales 1.0 0.0 --edit_strengths 0.6 0.8 0.95 --cfg_scale 7.0 \
+    "${@:2}"
 
 echo "[RUN] Done on $(date)"
