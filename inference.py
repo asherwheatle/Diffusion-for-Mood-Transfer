@@ -122,7 +122,20 @@ def edit_mood(
     mel_padded = mel_padded.to(device)
 
     z0 = ae.encoder(mel_padded)
-    # Same latent standardization used during diffusion training
+    # Same latent standardization used during diffusion training.
+    #
+    # Pin the stats to the latent's device first. They are computed from CPU
+    # latents in train.train_diffusion, and mood_diffusion.py's --mode full
+    # hands them straight to this function without moving them, so they arrive
+    # on the CPU while z0 is on the GPU. That went unnoticed while the stats
+    # were 0-dim tensors: PyTorch exempts 0-dim CPU tensors from the device
+    # check and promotes them like Python scalars. Per-channel stats are
+    # (1, C, 1, 1), get no such exemption, and raised "Expected all tensors to
+    # be on the same device" on job 43129637 — after a full 14,149-step train.
+    # The checkpoint loaders (evaluate.load_models, mood_diffusion edit mode)
+    # do call .to(device), so fixing it here covers the paths that do not.
+    latent_mean = latent_mean.to(z0.device)
+    latent_std = latent_std.to(z0.device)
     z0 = (z0 - latent_mean) / latent_std
     print(f"[EDIT] Latent z0: {z0.shape}")
 
