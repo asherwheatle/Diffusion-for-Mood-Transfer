@@ -172,6 +172,13 @@ class DiffusionConfig:
     # low end of the usual range and leaves the unconditional path thinly
     # trained, which makes the (cond - uncond) guidance direction noisy.
     cfg_dropout = 0.2
+    # Fraction of training rows whose melody embedding is zeroed, drawn
+    # independently of cfg_dropout (so ~3% of rows drop both and train the
+    # fully unconditional path). Zero is what melody_scale=0 feeds at
+    # inference, so this makes that knob in-distribution; before it,
+    # melody_scale=0 collapsed the text effect instead of loosening the lock
+    # (sweep_lock.py, job 43197309). 0.0 reproduces pre-Sep-24 training.
+    melody_dropout = 0.15
 
     # Inference
     num_inference_steps = 50

@@ -420,6 +420,9 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
             # buffers and is applied by load_state_dict.
             "clap_align": align_mode if cond_source == "audio" else "none",
             "clap_text_paraphrases": use_paraphrases,
+            # Provenance only: tells whether melody_scale=0 is in-distribution
+            # for this checkpoint (0.0 = never trained without melody).
+            "melody_dropout": getattr(cfg, "melody_dropout", 0.0),
         }
         # Inference-ready copy (what evaluate.py / edit mode load) ...
         _atomic_save(state, os.path.join(cfg.output_dir, "diffusion.pt"))
@@ -440,6 +443,18 @@ def train_diffusion(ae: LatentAutoencoder, mel_batch: torch.Tensor,
         z_t = diffusion.q_sample(z0, t, noise)
 
         mel_emb = melody_enc(melody_all[idx].to(device, non_blocking=True), W_lat)
+        # Melody dropout: zero some rows' melody embedding so "no melody" is a
+        # state the model has trained on. Zero is exactly what inference's
+        # melody_scale=0 feeds the ControlNet, so the two match with no
+        # inference change. Without this, melody_scale=0 was off-distribution
+        # and collapsed the text effect in both directions (sweep_lock.py, job
+        # 43197309: happy push 3%, sad 14% of the real gap at strength 0.6),
+        # so the melody lock could not be loosened to test whether it blocks
+        # sad -> happy. Drawn independently of the text dropout below.
+        mel_drop_p = getattr(cfg, "melody_dropout", 0.0)
+        if mel_drop_p > 0:
+            keep = torch.rand(cfg.batch_size, 1, 1, device=device) >= mel_drop_p
+            mel_emb = mel_emb * keep
 
         if clap_emb_all is not None:
             clap_emb = clap_emb_all[idx].to(device)   # (B, clap_dim), a fresh copy
