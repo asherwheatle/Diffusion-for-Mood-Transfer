@@ -168,6 +168,10 @@ class DiffusionConfig:
     # like-for-like one.
     diff_epochs = 14149
     cfg_scale = 1.5
+    # Guidance rescale phi (inference.edit_mood). 0 = plain CFG (the original
+    # behaviour); ~0.7 is the usual value from Lin et al. 2023. Only matters
+    # at large cfg_scale, where plain CFG overshoots the latent's scale.
+    cfg_rescale = 0.0
     # Fraction of training steps that see the null text embedding. 0.1 is the
     # low end of the usual range and leaves the unconditional path thinly
     # trained, which makes the (cond - uncond) guidance direction noisy.
