@@ -191,6 +191,16 @@ class DiffusionConfig:
     # value lets an SDEdit trajectory leave the input's basin instead of
     # retracing it. 1.0 recovers ancestral/DDPM sampling.
     ddim_eta = 0.0
+    # How edit_mood gets its starting latent at t_start.
+    #   "noise"  — SDEdit: q_sample z0 with fresh Gaussian noise (the original
+    #              behaviour). The noise knows nothing about the song, so at
+    #              strength 0.8 even the cfg-0 arm kept only 71% of the melody.
+    #   "invert" — deterministic DDIM inversion: run the model from z0 up to
+    #              t_start, so the starting latent already encodes the song's
+    #              structure and denoising retraces it except where the text
+    #              pushes. Costs one extra model pass per step.
+    # "invert" needs ddim_eta = 0 to be exact; eta > 0 re-injects fresh noise.
+    edit_init = "noise"
     # Scales the melody embedding feeding the ControlNet branch. 1.0 = as
     # trained; 0 = no melody information (mood-edit headroom test, see
     # ablate_melody.py). Lower values trade melody preservation for

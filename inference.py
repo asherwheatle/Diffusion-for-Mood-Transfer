@@ -1,4 +1,4 @@
-"""Mood editing inference via SDEdit + classifier-free guidance."""
+"""Mood editing inference via SDEdit or DDIM inversion + classifier-free guidance."""
 
 import numpy as np
 import torch
@@ -78,6 +78,7 @@ def edit_mood(
     melody_scale: float = None,
     cond_emb: torch.Tensor = None,
     cond_space: str = "audio",
+    invert_mood: str = None,
 ) -> torch.Tensor:
     """
     Edit the mood of an audio waveform using text conditioning.
@@ -90,6 +91,12 @@ def edit_mood(
       5. Decode -> BigVGAN -> output waveform
 
     edit_strength=0: no change. edit_strength=1: full regen from noise.
+
+    cfg.edit_init = "invert" replaces step 2 with DDIM inversion: the latent
+    at t_start comes from running the model backward from z0 instead of from
+    random noise, so it still encodes the song. Strength then sets how far up
+    the inversion goes, and 1.0 no longer means "a new song". invert_mood
+    picks the caption the inversion is conditioned on (default: null prompt).
 
     cond_emb overrides the conditioning vector. Normally the CLAP *text*
     embedding of `mood_text` is used; pass a (clap_dim,) tensor here to feed
@@ -188,11 +195,40 @@ def edit_mood(
     grid = np.linspace(t_start, 0, cfg.num_inference_steps + 1)
     timesteps = list(dict.fromkeys(grid.round().astype(int).tolist()))
 
-    noise = torch.randn_like(z0)
-    t_tensor = torch.tensor([t_start], device=device)
-    z_t = diffusion.q_sample(z0, t_tensor, noise)
+    init = getattr(cfg, "edit_init", "noise")
+    if init == "noise":
+        noise = torch.randn_like(z0)
+        t_tensor = torch.tensor([t_start], device=device)
+        z_t = diffusion.q_sample(z0, t_tensor, noise)
+    elif init == "invert":
+        # DDIM inversion (Song et al. 2021; Mokady et al. 2023): walk the same
+        # grid upward, 0 -> t_start, with the deterministic DDIM update — the
+        # step formula is direction-agnostic. No guidance here: inversion is
+        # only exact for the prediction it was built with, and CFG'd
+        # predictions drift. With the null prompt (default) the cfg-0 arm of
+        # the denoising loop reuses exactly this prediction, so it should
+        # return z0 up to discretization error — the check that inversion
+        # works. invert_mood inverts with that mood's caption instead
+        # (prompt-to-prompt style: invert with the source, edit to the target).
+        if invert_mood is None:
+            inv_emb = null_text_emb
+        else:
+            inv_emb = text_enc(text_enc.align_text(
+                text_enc.encode([mood_prompt(invert_mood)])))
+        if getattr(cfg, "ddim_eta", 0.0) != 0.0:
+            print("[EDIT] warning: ddim_eta > 0 re-injects noise, so the "
+                  "denoising pass cannot retrace the inversion")
+        up = timesteps[::-1]
+        z_t = z0
+        for i in tqdm(range(len(up) - 1), desc="Inverting"):
+            t_cur = torch.tensor([up[i]], device=device)
+            t_next = torch.tensor([up[i + 1]], device=device)
+            v = dit(z_t, t_cur, inv_emb, melody_emb)
+            z_t = diffusion.ddim_step(z_t, v, t_cur, t_next, eta=0.0)
+    else:
+        raise ValueError(f"unknown edit_init {init!r}")
 
-    print(f"[EDIT] SDEdit from t={t_start} ({len(timesteps) - 1} steps), "
+    print(f"[EDIT] {init} init from t={t_start} ({len(timesteps) - 1} steps), "
           f"CFG scale={cfg.cfg_scale}, "
           f"rescale={getattr(cfg, 'cfg_rescale', 0.0)}, eta={getattr(cfg, 'ddim_eta', 0.0)}, "
           f"melody_scale={melody_scale}")

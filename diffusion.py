@@ -72,6 +72,9 @@ class GaussianDiffusion:
         trajectory started from a lightly-noised input tends to retrace that
         input, leaving the conditioning little room to move it. eta=1 recovers
         DDPM-style ancestral sampling.
+
+        With eta=0 and t_prev > t this is a DDIM *inversion* step: the same
+        update, walked upward (inference.edit_mood, edit_init="invert").
         """
         x0_pred = self.predict_x0_from_v(x_t, v, t)
         eps_pred = self.predict_eps_from_v(x_t, v, t)
