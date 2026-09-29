@@ -2,7 +2,7 @@
 
 This model's architecture is based on **Hou, S., et al. (2024), "Editing music with melody and text: Using ControlNet for diffusion transformer," arXiv:2410.05151** — a Diffusion Transformer (DiT) paired with a ControlNet branch for melody-preserving, text-guided music editing.
 
-This repo rebuilds that design with three additions (see [paper/methodology.md](paper/methodology.md) for full details): a compact mel-spectrogram latent space, mood conditioning via CLAP audio/text embeddings, and an explicit correction for the modality gap between CLAP's audio and text embedding spaces. The referenced results table (`Ours w/ cross attention`, `Ours w/o masking strategy`, `Ours`, vs. `MusicGen-stereo-melody` baselines on FD, KL, CLAP score, melody accuracy) is from Hou et al.'s original ablations, which this project's `evaluate.py` metrics are modeled after.
+This repo rebuilds that design with three additions (see [paper/methodology.md](paper/methodology.md) for full details): a compact mel-spectrogram latent space, mood conditioning via CLAP audio/text embeddings, and an explicit correction for the modality gap between CLAP's audio and text embedding spaces. Hou et al. evaluate with FD, KL, CLAP score and melody accuracy against MusicGen-stereo-melody baselines. This project's `evaluate.py` follows the same two axes but not the same metrics: mood transfer is scored with CLAP margins and a valence probe, melody preservation with chroma similarity. Its numbers are not directly comparable to the paper's table.
 
 # Version Control Instructions
 

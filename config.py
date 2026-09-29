@@ -168,10 +168,21 @@ class DiffusionConfig:
     # like-for-like one.
     diff_epochs = 14149
     cfg_scale = 1.5
+    # Guidance rescale phi (inference.edit_mood). 0 = plain CFG (the original
+    # behaviour); ~0.7 is the usual value from Lin et al. 2023. Only matters
+    # at large cfg_scale, where plain CFG overshoots the latent's scale.
+    cfg_rescale = 0.0
     # Fraction of training steps that see the null text embedding. 0.1 is the
     # low end of the usual range and leaves the unconditional path thinly
     # trained, which makes the (cond - uncond) guidance direction noisy.
     cfg_dropout = 0.2
+    # Fraction of training rows whose melody embedding is zeroed, drawn
+    # independently of cfg_dropout (so ~3% of rows drop both and train the
+    # fully unconditional path). Zero is what melody_scale=0 feeds at
+    # inference, so this makes that knob in-distribution; before it,
+    # melody_scale=0 collapsed the text effect instead of loosening the lock
+    # (sweep_lock.py, job 43197309). 0.0 reproduces pre-Sep-24 training.
+    melody_dropout = 0.15
 
     # Inference
     num_inference_steps = 50

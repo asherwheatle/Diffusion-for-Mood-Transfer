@@ -193,7 +193,8 @@ def edit_mood(
     z_t = diffusion.q_sample(z0, t_tensor, noise)
 
     print(f"[EDIT] SDEdit from t={t_start} ({len(timesteps) - 1} steps), "
-          f"CFG scale={cfg.cfg_scale}, eta={getattr(cfg, 'ddim_eta', 0.0)}, "
+          f"CFG scale={cfg.cfg_scale}, "
+          f"rescale={getattr(cfg, 'cfg_rescale', 0.0)}, eta={getattr(cfg, 'ddim_eta', 0.0)}, "
           f"melody_scale={melody_scale}")
     print(f"[EDIT] Mood text: \"{mood_text}\"")
 
@@ -205,6 +206,19 @@ def edit_mood(
         v_cond = dit(z_t, t_cur, text_emb, melody_emb)
         v_uncond = dit(z_t, t_cur, null_text_emb, melody_emb)
         v_guided = v_uncond + cfg.cfg_scale * (v_cond - v_uncond)
+        # Guidance rescale (Lin et al. 2023, "Common Diffusion Noise Schedules
+        # and Sample Steps are Flawed", sec. 3.4). A large cfg_scale inflates
+        # the std of the guided v far past anything seen in training, which
+        # oversaturates the latent; by ear, strength-0.8 edits at cfg 7 lost
+        # their harmonic lines and turned into broadband fizz (listen/, job
+        # 43200245). Pulling the std back to the conditional prediction's keeps
+        # the guidance DIRECTION but not the overshoot. phi blends the two.
+        phi = getattr(cfg, "cfg_rescale", 0.0)
+        if phi > 0 and cfg.cfg_scale > 1.0:
+            dims = tuple(range(1, v_cond.dim()))
+            v_rescaled = v_guided * (v_cond.std(dim=dims, keepdim=True) /
+                                     (v_guided.std(dim=dims, keepdim=True) + 1e-8))
+            v_guided = phi * v_rescaled + (1 - phi) * v_guided
 
         z_t = diffusion.ddim_step(z_t, v_guided, t_cur, t_prev,
                                   eta=getattr(cfg, "ddim_eta", 0.0))

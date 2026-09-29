@@ -249,6 +249,7 @@ def main():
                            if getattr(cfg, "clap_cond_source", "text") == "audio"
                            else "none"),
             "clap_text_paraphrases": getattr(cfg, "clap_text_paraphrases", False),
+            "melody_dropout": getattr(cfg, "melody_dropout", 0.0),
         }, diff_path)
         print(f"  Saved diffusion model: {diff_path}")
 
