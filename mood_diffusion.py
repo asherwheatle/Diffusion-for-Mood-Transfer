@@ -68,8 +68,9 @@ def parse_args():
                         help="Input WAV for edit mode")
     parser.add_argument("--text", type=str, default="sad and melancholic",
                         help="Mood description for editing")
-    parser.add_argument("--edit_strength", type=float, default=0.35,
-                        help="0=no change, 1=full regen from noise")
+    parser.add_argument("--edit_strength", type=float, default=None,
+                        help="0=no change, 1=edit the whole trajectory "
+                             "(default: cfg.edit_strength)")
     parser.add_argument("--output_dir", type=str, default="output")
     parser.add_argument("--song_index", type=int, default=0)
     parser.add_argument("--n_songs", type=int, default=None,
@@ -90,7 +91,8 @@ def main():
 
     cfg = DiffusionConfig()
     cfg.output_dir = args.output_dir
-    cfg.edit_strength = args.edit_strength
+    if args.edit_strength is not None:
+        cfg.edit_strength = args.edit_strength
     if args.ae_epochs is not None:
         cfg.ae_epochs = args.ae_epochs
     if args.diff_epochs is not None:

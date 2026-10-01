@@ -754,7 +754,8 @@ def main():
                    help="Pick edit songs by even spread over the corpus "
                         "(the old behaviour, which inherits DEAM's ~70/30 "
                         "skew) instead of balancing across moods.")
-    p.add_argument("--edit_strength", type=float, default=0.5)
+    p.add_argument("--edit_strength", type=float, default=None,
+                   help="Override cfg.edit_strength (default: the config value)")
     p.add_argument("--cfg_scale", type=float, default=None,
                    help="Override cfg.cfg_scale (default: the config value). "
                         "The config default is tuned for training-time "
@@ -775,10 +776,12 @@ def main():
     np.random.seed(args.seed)
 
     cfg = DiffusionConfig()
-    cfg.edit_strength = args.edit_strength
+    if args.edit_strength is not None:
+        cfg.edit_strength = args.edit_strength
     if args.cfg_scale is not None:
         cfg.cfg_scale = args.cfg_scale
-    print(f"[EVAL] cfg_scale={cfg.cfg_scale}  edit_strength={cfg.edit_strength}")
+    print(f"[EVAL] cfg_scale={cfg.cfg_scale}  edit_strength={cfg.edit_strength}  "
+          f"edit_init={cfg.edit_init}")
 
     va = load_annotations(args.annotations_dir, cfg.clip_start_seconds,
                           cfg.clip_seconds)

@@ -6,7 +6,7 @@
 #   e.g.        sbatch run_eval.sh output/job_40998207
 #               sbatch run_eval.sh output/job_40998207 7.0 0.8
 #   (no arg -> evaluates the newest output/job_* directory)
-#   (defaults: cfg_scale 5.0, edit_strength 0.6)
+#   (defaults: cfg_scale 7.0, edit_strength 0.8 — with cfg.edit_init="invert")
 # Monitor with: squeue -u $USER
 # Results land in $CKPT_DIR: eval_edits.csv, clap_validation.csv, eval_summary.txt
 # =============================================================================
@@ -74,8 +74,8 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # of 1.5 — that is a training-time default, and evaluating at it measured the
 # model at a third of the guidance the probes showed conditioning needs.
 # Override per run:  sbatch run_eval.sh output/job_XXXXXX 7.0 0.8
-CFG_SCALE="${2:-5.0}"
-EDIT_STRENGTH="${3:-0.6}"
+CFG_SCALE="${2:-7.0}"
+EDIT_STRENGTH="${3:-0.8}"
 echo "[RUN] cfg_scale=$CFG_SCALE  edit_strength=$EDIT_STRENGTH"
 
 python evaluate.py \

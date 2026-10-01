@@ -186,7 +186,11 @@ class DiffusionConfig:
 
     # Inference
     num_inference_steps = 50
-    edit_strength = 0.35
+    # 0.8 with edit_init="invert": sweep_quality.py (job 43962847) measured
+    # 89% melody kept and a 54% happy push at cfg 7, and the edits keep the
+    # recognizable melody by ear. With "noise", 0.8 garbles the melody (64%
+    # kept); use ~0.5 there.
+    edit_strength = 0.8
     # DDIM stochasticity. 0 = deterministic (the original behaviour); a small
     # value lets an SDEdit trajectory leave the input's basin instead of
     # retracing it. 1.0 recovers ancestral/DDPM sampling.
@@ -200,7 +204,10 @@ class DiffusionConfig:
     #              structure and denoising retraces it except where the text
     #              pushes. Costs one extra model pass per step.
     # "invert" needs ddim_eta = 0 to be exact; eta > 0 re-injects fresh noise.
-    edit_init = "noise"
+    # Default since Oct 2026: at the same strength, inversion's cfg-0 round
+    # trip keeps 98-101% of the melody vs 49-78% for noise (job 43962847).
+    # "noise" reproduces earlier runs.
+    edit_init = "invert"
     # Scales the melody embedding feeding the ControlNet branch. 1.0 = as
     # trained; 0 = no melody information (mood-edit headroom test, see
     # ablate_melody.py). Lower values trade melody preservation for
