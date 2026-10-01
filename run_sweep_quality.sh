@@ -56,7 +56,7 @@ python sweep_quality.py \
     --audio_dir "$DATA_ROOT/MEMD_audio" \
     --annotations_dir "$DATA_ROOT/DEAM_Annotations" \
     --clap_ckpt "$CLAP_CKPT" \
-    --n_songs 30 --edit_strengths 0.6 0.8 1.0 --guidance 3 7 --inits noise invert \
+    --n_songs 30 --edit_strengths 0.8 0.9 --guidance 5 7 10 --inits invert invert_src \
     "${@:2}"
 
 echo "[RUN] Done on $(date)"
