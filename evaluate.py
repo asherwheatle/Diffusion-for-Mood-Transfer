@@ -109,6 +109,27 @@ def chroma_similarity(wav_a: np.ndarray, wav_b: np.ndarray, sr: int) -> float:
     return float((ca * cb).sum(axis=0).mean())
 
 
+_MELODY_EXTRACTOR = None
+
+
+def melody_accuracy(wav_ref: np.ndarray, wav_out: np.ndarray, sr: int) -> float:
+    """Hou et al. (2024) melody accuracy: fraction of frames whose dominant
+    pitch class matches between the reference and the output.
+
+    Both melodies come from MelodyExtractor (high-pass at middle C, 128-bin
+    CQT, hop 512), the same top-k CQT melody prompt the paper and this model
+    condition on; the top-1 bin of each frame, mod 12, is its pitch class.
+    Exact match per frame, so it is much stricter than chroma_similarity's
+    partial-credit cosine. Chance is ~1/12."""
+    global _MELODY_EXTRACTOR
+    if _MELODY_EXTRACTOR is None or _MELODY_EXTRACTOR.sr != sr:
+        _MELODY_EXTRACTOR = MelodyExtractor(sr=sr)
+    pa = (_MELODY_EXTRACTOR.extract(wav_ref)[0] - 1) % 12
+    pb = (_MELODY_EXTRACTOR.extract(wav_out)[0] - 1) % 12
+    t = min(len(pa), len(pb))
+    return float((pa[:t] == pb[:t]).mean())
+
+
 def _l2(x: np.ndarray) -> np.ndarray:
     return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
 
@@ -373,6 +394,7 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0,
                   "clap_gain", "clap_gain_recon", "clap_margin",
                   "clap_pred_edited", "transfer_success",
                   "chroma_sim", "chroma_recon",
+                  "melody_acc", "melody_acc_recon",
                   "valence_original", "valence_recon", "valence_edited",
                   "valence_shift", "valence_shift_recon", "valence_margin",
                   "valence_target_sign", "valence_correct_dir",
@@ -413,6 +435,7 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0,
         rp_recon = (probe_recon.predict(recon_emb)
                     if probe_recon is not None else None)
         chroma_recon = chroma_similarity(wav_orig, wav_recon, sr)
+        mel_acc_recon = melody_accuracy(wav_orig, wav_recon, sr)
 
         song_seed = seed + si
         song_rows, cos_by_target, v_by_target = [], {}, {}
@@ -448,6 +471,8 @@ def evaluate_edits(cfg, clap, probe, files, va, sr, models, out_csv, seed=0,
                 "transfer_success": int(pred == target),
                 "chroma_sim": round(chroma_similarity(wav_orig, wav_edit, sr), 4),
                 "chroma_recon": round(float(chroma_recon), 4),
+                "melody_acc": round(melody_accuracy(wav_orig, wav_edit, sr), 4),
+                "melody_acc_recon": round(float(mel_acc_recon), 4),
                 "valence_original": round(float(v_orig), 4),
                 "valence_recon": round(float(v_recon), 4),
                 "valence_edited": round(float(v_edit), 4),
@@ -578,6 +603,8 @@ def summarize(rows, clap_acc, probe, out_txt, mood_gap=None,
               f"   chroma ceiling     : "
               f"{np.mean([r['chroma_recon'] for r in rows]):.3f}  "
               f"(recon vs original: no edit can score above this)",
+              f"   melody-acc ceiling : "
+              f"{100*np.mean([r['melody_acc_recon'] for r in rows]):.1f}%",
               " Any metric measured against the RAW input inherits these.", ""]
 
     # ---- Primary: margins (codec/song/noise all cancelled) ----
@@ -649,6 +676,9 @@ def summarize(rows, clap_acc, probe, out_txt, mood_gap=None,
               f"  {verdict(gr, gr_se)}",
               f" Overall transfer success   : {tr:.1f}%  (chance {100*chance:.1f}%)",
               f" Overall chroma preserved   : {np.mean([r['chroma_sim'] for r in rows]):.3f}",
+              f" Overall melody accuracy    : "
+              f"{100*np.mean([r['melody_acc'] for r in rows]):.1f}%  "
+              f"(Hou et al. 2024 metric; their model reports 56.6%)",
               ""]
 
     # ---- Confounded, kept only so old runs stay comparable ----
