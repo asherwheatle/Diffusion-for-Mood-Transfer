@@ -26,9 +26,14 @@ cfg_rescale is guidance rescale (Lin et al. 2023; see inference.edit_mood).
 "noise" is SDEdit, "invert" is DDIM inversion. With inversion, the null arm
 (cfg 0, null prompt) replays the inversion's own predictions backward, so its
 melody-kept should sit near 100%. If it does not, the inversion itself is
-lossy and the edit arms cannot be judged. --invert_prompt source inverts with
-the clip's own mood caption instead; the null arm is then no longer an exact
-round trip.
+lossy and the edit arms cannot be judged. "invert_src" inverts with the
+clip's own mood caption instead (prompt-to-prompt style: invert with the
+source, edit to the target), so the starting latent encodes "sad" explicitly
+and the happy prompt is pushing away from it rather than from nothing. Its
+null arm is not an exact round trip, since it denoises with the null prompt.
+
+--out_tag suffixes the CSV and the listening directory so a new sweep does not
+overwrite one that has already been listened to.
 
 WAVs for the first --n_listen songs of each mood go to
 <ckpt_dir>/listen_quality/<song>_<gt>/, named by setting, so the table can be
@@ -91,11 +96,12 @@ def main():
                    default=["1.5", "3", "7", "7:0.7"],
                    help="cfg_scale[:cfg_rescale] settings for the edit arm")
     p.add_argument("--inits", nargs="+", default=["noise", "invert"],
-                   choices=["noise", "invert"],
-                   help="Starting latent: SDEdit noise and/or DDIM inversion")
-    p.add_argument("--invert_prompt", choices=["null", "source"],
-                   default="null",
-                   help="Caption the inversion is conditioned on")
+                   choices=["noise", "invert", "invert_src"],
+                   help="Starting latent: SDEdit noise, DDIM inversion with "
+                        "the null prompt, and/or with the source mood caption")
+    p.add_argument("--out_tag", default="",
+                   help="Suffix for sweep_quality<_tag>.csv and "
+                        "listen_quality<_tag>/")
     p.add_argument("--n_listen", type=int, default=3,
                    help="Songs per mood to also write as WAVs")
     args = p.parse_args()
@@ -114,7 +120,8 @@ def main():
 
     raws = [load_clip(f, sr, cfg.clip_start_seconds, cfg.clip_seconds)
             for f in files]
-    listen_root = os.path.join(args.ckpt_dir, "listen_quality")
+    suffix = f"_{args.out_tag}" if args.out_tag else ""
+    listen_root = os.path.join(args.ckpt_dir, f"listen_quality{suffix}")
     n_listened = {"happy": 0, "sad": 0}
 
     rows = []
@@ -152,9 +159,9 @@ def main():
             sf.write(os.path.join(listen_dir, "1_recon.wav"), wav_ae, sr)
 
         source = SAD if gt == "sad" else HAPPY
-        invert_mood = source if args.invert_prompt == "source" else None
         for init in args.inits:
-          cfg.edit_init = init
+          cfg.edit_init = "invert" if init.startswith("invert") else init
+          invert_mood = source if init == "invert_src" else None
           for s in args.edit_strengths:
             cfg.edit_strength = s
             arms = [("null", HAPPY, 0.0, 0.0)] + [
@@ -177,7 +184,7 @@ def main():
                              wav, sr)
         print(f"  {song} gt={gt} [{si+1}/{len(files)}]", flush=True)
 
-    out_csv = os.path.join(args.ckpt_dir, "sweep_quality.csv")
+    out_csv = os.path.join(args.ckpt_dir, f"sweep_quality{suffix}.csv")
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader(); w.writerows(rows)
@@ -206,18 +213,18 @@ def summarize(rows, inits, strengths, guidance):
         lo, hi = raw(s)["chroma_unrelated"], ae(s)["chroma"]
         return (r["chroma"] - lo) / (hi - lo)
 
-    print("\n" + "=" * 107)
+    print("\n" + "=" * 111)
     print(" MOOD PUSH vs QUALITY  (push in % of the real happy-vs-sad CLAP gap "
           f"{raw_gap:+.4f})")
     print(f" codec recon: melody kept 100% by definition; raw harm/recon harm "
           f"{np.mean([raw(s)['harm'] / ae(s)['harm'] for s in songs]):.2f}")
-    print("=" * 107)
-    print(f" {'init':>6s} {'str':>4s} {'cfg':>4s} {'rs':>4s} | {'happy push':>10s} "
+    print("=" * 111)
+    print(f" {'init':>10s} {'str':>4s} {'cfg':>4s} {'rs':>4s} | {'happy push':>10s} "
           f"{'s->h xfer':>9s} {'sad push':>9s} {'h->s xfer':>9s} | "
           f"{'harm vs recon':>13s} {'melody kept':>11s}")
     for init, st in ((i, s) for i in inits for s in strengths):
         null = lambda s: idx[(s, "null", init, st, 0.0, 0.0)]
-        print(f" {init:>6s} {st:4.2f} null      | {'':10s} {'':9s} {'':9s} {'':9s} | "
+        print(f" {init:>10s} {st:4.2f} null      | {'':10s} {'':9s} {'':9s} {'':9s} | "
               f"{np.mean([rel_harm(s, null(s)) for s in songs]):13.2f} "
               f"{100*np.mean([melody_kept(s, null(s)) for s in songs]):10.0f}%")
         for g, r in guidance:
@@ -232,7 +239,7 @@ def summarize(rows, inits, strengths, guidance):
                      [rel_harm(s, e(s, "sad")) for s in happy_songs])
             mel = ([melody_kept(s, e(s, "happy")) for s in sad_songs] +
                    [melody_kept(s, e(s, "sad")) for s in happy_songs])
-            print(f" {init:>6s} {st:4.2f} {g:4.1f} {r:4.1f} | {100*hp/raw_gap:9.0f}% "
+            print(f" {init:>10s} {st:4.2f} {g:4.1f} {r:4.1f} | {100*hp/raw_gap:9.0f}% "
                   f"{100*hx:8.0f}% {100*sp/raw_gap:8.0f}% {100*sx:8.0f}% | "
                   f"{np.mean(edits):13.2f} {100*np.mean(mel):10.0f}%")
     print(" push: CLAP distance the TEXT moved clips toward the target vs the")
@@ -242,7 +249,7 @@ def summarize(rows, inits, strengths, guidance):
     print("   100% = codec recon, 0% = an unrelated song.")
     print(" invert: the null row is the inversion round trip; near 100% melody")
     print("   kept means the inversion is faithful.")
-    print("=" * 107)
+    print("=" * 111)
 
 
 if __name__ == "__main__":

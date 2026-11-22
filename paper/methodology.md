@@ -14,9 +14,9 @@ The pipeline has seven stages (Figure 1):
 6. **Latent → mel.** The autoencoder decoder reconstructs the spectrogram.
 7. **Mel → waveform.** A pretrained BigVGAN vocoder synthesizes the output audio.
 
-Editing uses SDEdit (Meng et al., 2022). The input latent is partially noised and then denoised under the target mood, with classifier-free guidance applied to the mood condition only.
+Editing starts from a deterministic DDIM inversion of the input latent (Song et al., 2021; Mokady et al., 2023) rather than from SDEdit-style random noising (Meng et al., 2022). The inverted latent is then denoised under the target mood, with classifier-free guidance applied to the mood condition only.
 
-> **Figure 1 (suggested).** Block diagram. Top row (training): DEAM clip → mel → AE encoder → $z_0$ → noise → DiT+ControlNet → $v$-loss. The CQT melody feeds the ControlNet branch. The CLAP audio embedding passes through alignment and projection into cross-attention. Bottom row (inference): input clip → $z_0$ → partial noising → guided DDIM → AE decoder → BigVGAN → output. The CLAP text embedding of the target caption replaces the audio embedding.
+> **Figure 1 (suggested).** Block diagram. Top row (training): DEAM clip → mel → AE encoder → $z_0$ → noise → DiT+ControlNet → $v$-loss. The CQT melody feeds the ControlNet branch. The CLAP audio embedding passes through alignment and projection into cross-attention. Bottom row (inference): input clip → $z_0$ → DDIM inversion to $\tau_0$ → guided DDIM → AE decoder → BigVGAN → output. The CLAP text embedding of the target caption replaces the audio embedding.
 
 ---
 
@@ -44,17 +44,19 @@ Arousal is not used. We use valence alone for two reasons. It is the affective a
 
 The dead band removes 2,985 clips (27.6%). The remaining 7,827 labeled clips are imbalanced: 5,543 happy (70.8%) and 2,284 sad (29.2%).
 
-### 3.2.3 Class balancing by waveform augmentation
+### 3.2.3 Waveform augmentation
 
-We bring the minority class up to parity with new augmented clips rather than only reweighting. Each real sad clip receives $n_j$ augmented variants. Let $N_{\max}$ be the size of the majority class and $N_{\text{sad}}$ the number of real sad clips. The target mean is $r = \min(N_{\max}/N_{\text{sad}} - 1,\ 12)$, and $n_j$ is obtained by stochastic rounding of $r$ ($\lfloor r \rfloor$ or $\lceil r \rceil$, with expectation $r$), so the class total hits the target exactly. In our data, $r \approx 1.43$.
-
-Each variant applies three length-preserving transformations in sequence, with parameters drawn independently for every variant:
+Every real labeled clip, of either mood, receives exactly one augmented variant. The variant applies three length-preserving transformations in sequence, with parameters drawn independently for every variant:
 
 - **Pitch shift** by $u \sim \mathcal{U}(-2, 2)$ semitones (phase-vocoder pitch shifting).
 - **Time shift** by an integer number of samples drawn uniformly from $[-0.2L, 0.2L]$, where $L$ is the clip length. The vacated region is zero-filled rather than wrapped, so the end of the clip is never spliced onto its start.
 - **Additive white Gaussian noise** at an SNR drawn from $\mathcal{U}(20, 35)$ dB.
 
-The output is clipped to $[-1, 1]$. The perturbations are kept small so that they do not change perceived valence. Augmented clips go through the full feature pipeline (mel, melody, CLAP embedding) *after* augmentation, so every feature matches the audio it came from. Augmentation adds 3,237 sad clips. The final training set has **11,064 clips: 5,543 happy and 5,521 sad**. The dataset is shuffled once with a fixed seed and cached to disk.
+The output is clipped to $[-1, 1]$. The perturbations are kept small so that they do not change perceived valence. Augmented clips go through the full feature pipeline (mel, melody, CLAP embedding) *after* augmentation, so every feature matches the audio it came from.
+
+Augmentation adds variety only; it does not balance the classes. An earlier version augmented only the minority (sad) class up to parity with the majority. That made augmentation artifacts a proxy for the label: they appeared in 59% of sad clips and 0% of happy ones. On real clips, the artifacts alone moved CLAP 0.069 toward the sad caption and the valence probe (§3.9.2) down by 0.061. Because training conditions on CLAP audio embeddings (§3.5.1), this contamination reached the conditioning vectors themselves. Augmenting both moods at the same rate makes the augmented fraction identical across classes, so the artifacts carry no mood information. Class balance is left to the mood-balanced sampler (§3.7).
+
+The final training set has **15,654 clips: 11,086 happy and 4,568 sad**, half of each real and half augmented. The dataset is shuffled once with a fixed seed and cached to disk.
 
 ### 3.2.4 Spectral front end
 
@@ -87,7 +89,9 @@ $$
 
 Here $\nabla_t$ and $\nabla_f$ are first differences along time and frequency, $P_{2^s}$ is $2^s \times 2^s$ average pooling, and $\lambda_1 = \lambda_g = 1$, $\lambda_{ms} = 0.5$ (all norms are means). The gradient term keeps harmonic ridges and onsets from being averaged away. The multi-scale term keeps the global spectral envelope. Together they act as a spectrogram-domain counterpart of a multi-resolution STFT loss.
 
-**Training.** Adam, learning rate $10^{-3}$, batch size 64, 100 epochs over all 11,064 training spectrograms. After training, the autoencoder is frozen. All latents are pre-encoded and standardized with a single global scalar mean and standard deviation ($\mu_z = 0.111$, $\sigma_z = 0.284$), so they approximately match the diffusion process's unit-variance noise assumption. At decoding time, the standardization is reversed.
+**Training.** Adam, learning rate $10^{-3}$, batch size 64, 100 epochs over all 15,654 training spectrograms. After training, the autoencoder is frozen. All latents are pre-encoded and standardized *per channel*, with a mean $\mu_z \in \mathbb{R}^{32}$ and standard deviation $\sigma_z \in \mathbb{R}^{32}$ computed over all clips and spatial positions, so every channel matches the diffusion process's unit-variance noise assumption. At decoding time, the standardization is reversed.
+
+An earlier version used one global scalar. The encoder's per-channel standard deviations span a factor of 21 (0.095 to 1.995), so under a single scalar the channels reached pure noise at very different timesteps. At $\tau = 600$, 28 of 32 channels had lost the input while 4 were still pinned to it. Every edit strength was then a mix of regenerating some channels and preserving others, and the strength knob could not trade melody preservation against mood change. With per-channel standardization, all channels cross over together.
 
 ---
 
@@ -107,7 +111,7 @@ Following Hou et al. (2024, §III-B), we represent melody as the few most energe
 
 Mood is represented in the embedding space of LAION-CLAP (Wu et al., 2023), using the HTSAT-base audio encoder and the publicly released music checkpoint (`music_audioset_epoch_15_esc_90.14`). CLAP is frozen throughout. Audio is resampled to 48 kHz before embedding, and all embeddings are $\ell_2$-normalized vectors in $\mathbb{R}^{512}$.
 
-The obvious approach would condition each clip on the CLAP *text* embedding of its mood label. That hands the conditioning network only two distinct vectors. With two inputs, the trainable projection can degenerate into a two-entry lookup table with no reason to preserve CLAP's semantic geometry. In our early experiments, a model trained this way responded to the prompt but moved the audio in directions unrelated to mood. We instead condition each clip on its own **CLAP audio embedding** $a_j$. This gives 11,064 distinct conditioning vectors, spread across the mood-relevant regions of the space. At inference, the text embedding of the target mood takes the place of the audio embedding. This substitution works because CLAP trains its audio and text towers to map into a shared space.
+The obvious approach would condition each clip on the CLAP *text* embedding of its mood label. That hands the conditioning network only two distinct vectors. With two inputs, the trainable projection can degenerate into a two-entry lookup table with no reason to preserve CLAP's semantic geometry. In our early experiments, a model trained this way responded to the prompt but moved the audio in directions unrelated to mood. We instead condition each clip on its own **CLAP audio embedding** $a_j$. This gives 15,654 distinct conditioning vectors, spread across the mood-relevant regions of the space. At inference, the text embedding of the target mood takes the place of the audio embedding. This substitution works because CLAP trains its audio and text towers to map into a shared space.
 
 ### 3.5.2 Correcting the modality gap
 
@@ -215,11 +219,13 @@ $$
 2. *Text substitution.* With probability $p_{\text{text}} = 0.25$, $c_j$ is replaced by $\phi_t(\mathrm{CLAP}_T(p))$, where $p$ is drawn uniformly from the paraphrase set of mood $m_j$. This trains the text pathway directly.
 3. *Condition dropout.* Independently, with probability $p_\varnothing = 0.2$, $c_j$ is replaced by $c_\varnothing$ to train the unconditional model used for guidance. We use a rate above the common 0.1 because an under-trained unconditional branch makes the guidance direction noisy.
 
-In expectation, about 60% of examples are conditioned on jittered audio embeddings, 20% on text paraphrases, and 20% on the null condition. The melody condition is never dropped.
+In expectation, about 60% of examples are conditioned on jittered audio embeddings, 20% on text paraphrases, and 20% on the null condition.
 
-**Mood-balanced sampling.** Minibatches are drawn with replacement, and each clip is weighted by $1/N_{m_j}$, so both moods have equal expected share in every batch regardless of any residual imbalance.
+**Melody dropout.** Independently of the mood condition, with probability $p_\mu = 0.15$ the melody embedding $\mu$ is set to zero. About 3% of examples therefore drop both conditions and train the fully unconditional model. Zero is exactly what the melody-strength ablation feeds at $\alpha = 0$ (§3.9.4), so this makes that setting in-distribution. Without melody dropout, setting $\alpha = 0$ collapsed the mood effect instead of loosening the melody constraint.
 
-**Optimization.** AdamW (learning rate $10^{-4}$, PyTorch default weight decay), batch size 64, 10,000 steps (about 58 passes over the training set), constant learning rate. The autoencoder and CLAP are frozen. The DiT, ControlNet branch, melody encoder, and conditioning projection are trained jointly. We use no EMA and no gradient clipping.
+**Mood-balanced sampling.** Minibatches are drawn with replacement, and each clip is weighted by $1/N_{m_j}$, so both moods have equal expected share in every batch even though the training set is about 71% happy. This sampler is the only class-balancing mechanism (§3.2.3).
+
+**Optimization.** AdamW (learning rate $10^{-4}$, PyTorch default weight decay), batch size 64, 14,149 steps (about 58 passes over the training set), constant learning rate. The step count was chosen to keep the number of passes equal to an earlier 10,000-step run on the smaller 11,064-clip set. The autoencoder and CLAP are frozen. The DiT, ControlNet branch, melody encoder, and conditioning projection are trained jointly. We use no EMA and no gradient clipping.
 
 ---
 
@@ -229,8 +235,8 @@ Given an input clip $x$ (5 s, mono, 44.1 kHz) and a target mood $m$:
 
 1. **Encode.** Compute $\tilde{S}$ (§3.2.4), $z_0 = (E(\tilde{S}) - \mu_z)/\sigma_z$, and the melody sequence $\mu$ (§3.4).
 2. **Condition.** $h = g\big(\phi_t(\mathrm{CLAP}_T(\text{caption}_m))\big)$ and $h_\varnothing = g(c_\varnothing)$, where $g$ is the projection of §3.5.4.
-3. **Partial noising (SDEdit).** Given an edit strength $s \in (0, 1)$, set $\tau_0 = \operatorname{clip}(\lfloor sT \rfloor, 1, T-1)$ and $z_{\tau_0} = \sqrt{\bar\alpha_{\tau_0}}\, z_0 + \sqrt{1 - \bar\alpha_{\tau_0}}\, \epsilon$. The strength $s$ trades fidelity to the input ($s \to 0$) against freedom to change it ($s \to 1$).
-4. **Guided denoising.** We run $K = 50$ steps on a grid of timesteps evenly spaced from $\tau_0$ to 0. With a fixed step count, edits at different strengths receive the same number of solver steps and are directly comparable. At each step, classifier-free guidance (Ho & Salimans, 2022) with scale $w$ is applied **to the mood condition only**. The melody condition is supplied to both branches, so it is never amplified:
+3. **DDIM inversion.** Given an edit strength $s \in (0, 1]$, set $\tau_0 = \operatorname{clip}(\lfloor sT \rfloor, 1, T-1)$ and build a grid of $K = 50$ steps evenly spaced between 0 and $\tau_0$. With a fixed step count, edits at different strengths receive the same number of solver steps and are directly comparable. Starting from $z_0$, we walk this grid *upward* with the deterministic DDIM update below, using the null condition $h_\varnothing$, the melody $\mu$, and no guidance, to obtain $z_{\tau_0}$. Inversion is exact only for the prediction it was built with, so guidance is not applied here. The strength $s$ trades fidelity to the input ($s \to 0$) against freedom to change it ($s \to 1$). Because the starting latent encodes the song, even $s = 1$ does not produce an unrelated clip.
+4. **Guided denoising.** We walk the same grid back down from $\tau_0$ to 0. At each step, classifier-free guidance (Ho & Salimans, 2022) with scale $w$ is applied **to the mood condition only**. The melody condition is supplied to both branches, so it is never amplified:
    $$
    \hat{v} = f_\theta(z_\tau, \tau, h_\varnothing, \mu) + w\big(f_\theta(z_\tau, \tau, h, \mu) - f_\theta(z_\tau, \tau, h_\varnothing, \mu)\big).
    $$
@@ -240,18 +246,20 @@ Given an input clip $x$ (5 s, mono, 44.1 kHz) and a target mood $m$:
    \hat{\epsilon} = \sqrt{1-\bar\alpha_\tau}\, z_\tau + \sqrt{\bar\alpha_\tau}\, \hat{v}, \quad
    z_{\tau'} = \sqrt{\bar\alpha_{\tau'}}\, \hat{z}_0 + \sqrt{1-\bar\alpha_{\tau'}}\, \hat{\epsilon}.
    $$
-   The implementation also supports stochastic DDIM ($\eta > 0$) and a scalar $\alpha$ applied to $\mu$, which we use only in the ablations of §3.9.4.
+   The same update, walked in the opposite direction, performs the inversion in step 3. With $w = 0$, denoising reuses exactly the predictions of the inversion and should return $z_0$ up to discretization error, which gives a direct check that the inversion is faithful (§3.9.4). The implementation also supports stochastic DDIM ($\eta > 0$, which breaks the inversion's exactness), guidance rescaling (Lin et al., 2024; off by default), inversion under the source mood's caption instead of $h_\varnothing$, and a scalar $\alpha$ applied to $\mu$. These are used only in the diagnostics of §3.9.4.
 5. **Decode.** De-standardize the latent, decode with $D$, crop to $128 \times 430$, invert the mel normalization, synthesize with the pretrained BigVGAN v2 vocoder (44.1 kHz, 128 bands, 512× upsampling; Lee et al., 2023), and clamp to $[-1, 1]$.
 
-Unless stated otherwise, the edits in our evaluation use $s = 0.5$, $w = 1.5$, and $K = 50$.
+Unless stated otherwise, the edits in our evaluation use $s = 0.8$, $w = 7$, and $K = 50$.
 
-**Relation to Hou et al. (2024).** We keep the core of their design: a DiT with a ControlNet branch, top-$k$ CQT melody conditioning, $v$-prediction, SDEdit-style editing, and guidance on text only. We depart from it in the following ways:
+**Why inversion rather than SDEdit.** Earlier versions started from the SDEdit latent $z_{\tau_0} = \sqrt{\bar\alpha_{\tau_0}}\, z_0 + \sqrt{1 - \bar\alpha_{\tau_0}}\, \epsilon$ with fresh Gaussian noise $\epsilon$. That noise carries no information about the song, so the model must rebuild it from the melody embedding alone, and pitch content is lost along the way. The mood change only became audible at strengths ($s \ge 0.8$) where the edits, by ear, were no longer music: harmonic lines broke into fragments over broadband noise. The codec was ruled out as the cause, since autoencoder–vocoder reconstructions keep their harmonics. In the quality sweep of §3.9.4, the unguided ($w = 0$) round trip kept 49–78% of the melody with SDEdit noise across strengths 0.6–1.0, against 98–101% with inversion.
+
+**Relation to Hou et al. (2024).** We keep the core of their design: a DiT with a ControlNet branch, top-$k$ CQT melody conditioning, $v$-prediction, editing by partially re-running the diffusion process on the input, and guidance on text only. We depart from it in the following ways:
 
 - A small, purpose-trained mel autoencoder and BigVGAN vocoder replace a large pretrained latent audio model.
 - Conditioning on CLAP audio embeddings, with modality-gap alignment and paraphrase augmentation, replaces direct text conditioning.
 - The base DiT and the ControlNet branch are trained jointly from scratch.
 - A DDIM sampler replaces DPM-Solver++.
-- The default guidance scale is much lower (1.5 rather than 7). Stronger guidance is examined in §3.9.4.
+- Edits start from a DDIM inversion of the input rather than from SDEdit-style partial noising.
 
 ---
 
@@ -291,7 +299,7 @@ Every edit passes through the autoencoder and vocoder, and this resynthesis lowe
 
 1. **Guidance sweep.** A grid over $w \in \{1, 3, 5, 7\}$ and $s \in \{0.6, 0.8\}$. For each setting, we measure how much edits of the same song toward different moods differ from each other: mean pairwise waveform RMS difference and mean pairwise CLAP cosine distance. We also report gain, transfer, and chroma. If the edits do not differ at all, the conditioning has no effect. If they differ but gain is not positive, the model responds to the condition but not along the mood direction.
 
-2. **Melody-strength ablation.** The melody embedding is scaled by $\alpha \in \{0, 0.25, 0.5, 1\}$ (with $w = 5$, $s = 0.6$). We also report the ratio of the mean melody-token norm to the mean latent-token norm. This tests whether ControlNet melody conditioning pins the output to the input and blocks mood changes. If mood metrics improve as $\alpha$ falls, melody is the bottleneck. If they stay flat while chroma similarity falls, it is not.
+2. **Melody-strength ablation.** The melody embedding is scaled by $\alpha \in \{0, 0.25, 0.5, 1\}$ (with $w = 5$, $s = 0.6$). Melody dropout during training (§3.7) makes $\alpha = 0$ an in-distribution input. We also report the ratio of the mean melody-token norm to the mean latent-token norm. This tests whether ControlNet melody conditioning pins the output to the input and blocks mood changes. If mood metrics improve as $\alpha$ falls, melody is the bottleneck. If they stay flat while chroma similarity falls, it is not.
 
 3. **Conditioning-vector probe.** With the same checkpoint, songs, and noise, we vary only the conditioning vector, across three arms:
    - **text**: the canonical caption passed through $\phi_t$, exactly as at inference;
@@ -306,11 +314,18 @@ Every edit passes through the autoencoder and vocoder, and this resynthesis lowe
 
    Comparing the arms locates a failure. If the audio arm has no effect, the conditioning pathway itself is not working. If the audio arm works but the text arm does not, the modality gap is the blocker. If the text arm reaches at least 80% of the audio arm's effect, the gap is effectively closed. The difference between text and text-raw measures what the alignment contributes.
 
+
+4. **Mood push versus audio quality.** CLAP gain and chroma similarity can both reward garbled audio. Chroma similarity between two *unrelated* songs is already about 0.67, so edits that were unrecognizable by ear still scored 0.85. This sweep scores each (initialization, strength, guidance) setting on mood push and on two structure measures. It uses 30 songs balanced by mood. Each song gets a null arm ($w = 0$) and one edit toward the *other* mood for each guidance value, all sharing one noise seed.
+   - **Push**: the CLAP movement toward the target caption relative to the null arm, expressed as a percentage of the gap between real happy and real sad clips. Measuring against the null arm cancels drift caused by resynthesis and the model's prior.
+   - **Melody kept**: chroma similarity to the original, rescaled so that the codec reconstruction scores 100% and an unrelated song scores 0%.
+   - **Harmonic ratio**: the fraction of spectral energy that harmonic–percussive source separation assigns to the harmonic part, relative to the codec reconstruction. Sustained pitched notes are harmonic; the broadband noise of garbled edits is not.
+
+   The initialization axis compares SDEdit noise, null-prompt inversion, and inversion under the source mood's caption. For null-prompt inversion, the null arm is the inversion round trip, so its melody-kept score checks inversion fidelity directly. WAV files for a few songs per mood are written alongside the table so each setting can be checked by ear. This sweep set the default operating point ($s = 0.8$, $w = 7$, null-prompt inversion), where edits keep 89% of the melody. At that setting, the push toward happy is 54% of the real-clip gap and the push toward sad is 92%.
 ---
 
 ## 3.10 Implementation Details
 
-Training runs on a single NVIDIA B200 GPU (183 GB) on the University of Florida HiPerGator cluster. Diffusion training proceeds at about 5.4 steps/s, so 10,000 steps take about 31 minutes. The software stack is PyTorch 2.7.0 (CUDA 12.8), librosa 0.11, and laion-clap. Decoded mel spectrograms, melody indices, and CLAP embeddings are cached after the first pass over the data. Training checkpoints (model, optimizer, and step) are written atomically at fixed intervals, so interrupted jobs resume exactly. Dataset shuffling, augmentation, the probe split, and evaluation sampling all use fixed seeds (0).
+Training runs on a single NVIDIA B200 GPU (183 GB) on the University of Florida HiPerGator cluster. Diffusion training proceeds at about 5.4 steps/s, so 14,149 steps take about 44 minutes. The software stack is PyTorch 2.7.0 (CUDA 12.8), librosa 0.11, and laion-clap. Decoded mel spectrograms, melody indices, and CLAP embeddings are cached after the first pass over the data. Training checkpoints (model, optimizer, and step) are written atomically at fixed intervals, so interrupted jobs resume exactly. Dataset shuffling, augmentation, the probe split, and evaluation sampling all use fixed seeds (0).
 
 **Table 1. Hyperparameters.**
 
@@ -320,9 +335,9 @@ Training runs on a single NVIDIA B200 GPU (183 GB) on the University of Florida 
 | | Clips per song | 6 (15–45 s) |
 | Labels | Valence dead band $\delta$ | 0.1 |
 | Augmentation | Pitch / time shift / SNR | ±2 st / ±20% / 20–35 dB |
-| | Max variants per clip | 12 |
+| | Variants per real clip / moods augmented | 1 / both |
 | Mel | $n_{\text{fft}}$ / hop / bands / range | 2048 / 512 / 128 / [−12, 2.5] |
-| Autoencoder | Channels / latent shape | 1-64-128-32 / 32×16×54 |
+| Autoencoder | Channels / latent shape / latent standardization | 1-64-128-32 / 32×16×54 / per channel |
 | | Loss weights (L1 / grad / multi-scale) | 1 / 1 / 0.5 |
 | | Optimizer / LR / batch / epochs | Adam / 1e−3 / 64 / 100 |
 | Melody | High-pass / CQT bins / bins per octave / $f_{\min}$ / hop / $k$ | 261.2 Hz / 128 / 12 / 8.18 Hz / 512 / 4 |
@@ -333,10 +348,10 @@ Training runs on a single NVIDIA B200 GPU (183 GB) on the University of Florida 
 | DiT | Width / heads / blocks / ControlNet blocks / MLP ratio | 256 / 4 / 8 / 4 / 4 |
 | | Trainable parameters | 20.3 M |
 | Diffusion | $T$ / schedule / target | 1000 / cosine / $v$ |
-| | Condition dropout $p_\varnothing$ | 0.2 |
-| | Optimizer / LR / batch / steps | AdamW / 1e−4 / 64 / 10,000 |
+| | Condition dropout $p_\varnothing$ / melody dropout $p_\mu$ | 0.2 / 0.15 |
+| | Optimizer / LR / batch / steps | AdamW / 1e−4 / 64 / 14,149 |
 | Inference | Sampler / steps / $\eta$ | DDIM / 50 / 0 |
-| | Edit strength $s$ / guidance $w$ | 0.5 / 1.5 |
+| | Initialization / edit strength $s$ / guidance $w$ | DDIM inversion (null prompt) / 0.8 / 7 |
 | Evaluation | Songs edited / CLAP validation songs / probe songs | 20 / 100 / 500 |
 
 ---
@@ -348,7 +363,9 @@ Training runs on a single NVIDIA B200 GPU (183 GB) on the University of Florida 
 - Hou, S., et al. (2024). Editing music with melody and text: Using ControlNet for diffusion transformer. *arXiv:2410.05151*.
 - Lee, S., Ping, W., Ginsburg, B., Catanzaro, B., & Yoon, S. (2023). BigVGAN: A universal neural vocoder with large-scale training. *ICLR*.
 - Liang, W., Zhang, Y., Kwon, Y., Yeung, S., & Zou, J. (2022). Mind the gap: Understanding the modality gap in multi-modal contrastive representation learning. *NeurIPS*.
+- Lin, S., Liu, B., Li, J., & Yang, X. (2024). Common diffusion noise schedules and sample steps are flawed. *WACV*.
 - Meng, C., He, Y., Song, Y., Song, J., Wu, J., Zhu, J.-Y., & Ermon, S. (2022). SDEdit: Guided image synthesis and editing with stochastic differential equations. *ICLR*.
+- Mokady, R., Hertz, A., Aberman, K., Pritch, Y., & Cohen-Or, D. (2023). Null-text inversion for editing real images using guided diffusion models. *CVPR*.
 - Nichol, A., & Dhariwal, P. (2021). Improved denoising diffusion probabilistic models. *ICML*.
 - Peebles, W., & Xie, S. (2023). Scalable diffusion models with transformers. *ICCV*.
 - Salimans, T., & Ho, J. (2022). Progressive distillation for fast sampling of diffusion models. *ICLR*.
